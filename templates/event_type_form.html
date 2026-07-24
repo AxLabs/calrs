@@ -424,7 +424,7 @@
 </details>
 
 <!-- Collapsible: Booking options -->
-<details class="card collapsible-section" style="margin-top: 1rem;"{% if editing and (form_requires_confirmation or (form_max_additional_guests is defined and form_max_additional_guests and form_max_additional_guests != 0) or (form_default_calendar_view is defined and form_default_calendar_view and form_default_calendar_view != "month")) %} open{% endif %}>
+<details class="card collapsible-section" style="margin-top: 1rem;"{% if editing and (form_requires_confirmation or (form_max_additional_guests is defined and form_max_additional_guests and form_max_additional_guests != 0) or (form_default_calendar_view is defined and form_default_calendar_view and form_default_calendar_view != "month") or (selected_resource_ids is defined and selected_resource_ids)) %} open{% endif %}>
   <summary class="collapsible-header">
     <h2>Booking options</h2>
     <span class="collapsible-hint" id="options-hint"></span>
@@ -502,6 +502,11 @@
           {{ t("event-type-form-resources-mode-round-robin") }}
         </label>
       </div>
+    </div>
+    {% elif can_manage_resources is defined and can_manage_resources %}
+    <div style="border-top: 1px solid var(--border); padding-top: 1rem; margin-top: 0.75rem;">
+      <label style="font-weight: 600; font-size: 0.925rem; display: block; margin-bottom: 0.5rem;">{{ t("event-type-form-resources-label") }}</label>
+      <span class="hint" style="font-size: 0.825rem; color: var(--text-muted); display: block;">No shared resources configured yet. Add one (demo lab, meeting room) in the <a href="/dashboard/admin" style="color: var(--accent); text-decoration: none;">admin panel</a> to require it here.</span>
     </div>
     {% endif %}
   </div>

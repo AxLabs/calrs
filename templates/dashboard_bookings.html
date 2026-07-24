@@ -15,6 +15,7 @@
       <div><strong>{{ b.event_title }}</strong> with {{ b.guest_name }}</div>
       <div style="color: var(--text-muted); font-size: 0.85rem;">{{ b.start_at }} &middot; {{ b.guest_email }}</div>
       {% if b.start_at_guest %}<div style="color: var(--text-muted); font-size: 0.75rem;">Guest booked: {{ b.start_at_guest }}</div>{% endif %}
+      {% if b.resource_name %}<div style="color: var(--text-muted); font-size: 0.75rem;">Resource: {{ b.resource_name }}</div>{% endif %}
     </div>
     <div class="booking-actions">
       <form method="post" action="/dashboard/bookings/{{ b.id }}/confirm" style="margin: 0;">
@@ -65,6 +66,7 @@
         </div>
         <div style="color: var(--text-muted); font-size: 0.85rem;">{{ b.start_at }} &middot; {{ b.guest_email }}</div>
         {% if b.start_at_guest %}<div style="color: var(--text-muted); font-size: 0.75rem;">Guest booked: {{ b.start_at_guest }}</div>{% endif %}
+        {% if b.resource_name %}<div style="color: var(--text-muted); font-size: 0.75rem;">Resource: {{ b.resource_name }}</div>{% endif %}
       </div>
       <div class="booking-actions">
         {% if not (b.awaiting_reschedule is defined and b.awaiting_reschedule) %}

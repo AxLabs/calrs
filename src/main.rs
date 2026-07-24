@@ -17,6 +17,7 @@ mod i18n;
 mod models;
 mod oauth2_caldav;
 mod providers;
+mod resources;
 mod rrule;
 mod settings;
 mod utils;
@@ -70,6 +71,11 @@ enum Commands {
     User {
         #[command(subcommand)]
         command: commands::user::UserCommands,
+    },
+    /// Probe and manage shared resource calendars (demo lab, meeting rooms, …)
+    Resource {
+        #[command(subcommand)]
+        command: commands::resource::ResourceCommands,
     },
     /// Configure calrs settings (SMTP, auth, etc.)
     Config {
@@ -136,6 +142,7 @@ async fn main() -> Result<()> {
             commands::booking::run(&pool, &secret_key, command).await?
         }
         Commands::User { command } => commands::user::run(&pool, &data_dir, command).await?,
+        Commands::Resource { command } => commands::resource::run(command).await?,
         Commands::Config { command } => commands::config::run(&pool, &secret_key, command).await?,
         Commands::Serve { port, host } => {
             // Load DB-backed runtime settings (base URL, private-host allowlist)

@@ -998,8 +998,9 @@ async fn cancel_orphaned_booking(
     uid: &str,
 ) {
     // Fetch booking details before cancelling. Scoped by source_id via the
-    // caldav_sources join: the source's account must match the booking's
-    // event-type account.
+    // caldav_sources join: the booking must have been pushed to this
+    // source's write calendar. The host contact is the assigned member
+    // when set (#147), the event type owner otherwise.
     let booking: Option<(
         String,
         String,
@@ -1019,12 +1020,14 @@ async fn cancel_orphaned_booking(
          FROM bookings b
          JOIN event_types et ON et.id = b.event_type_id
          JOIN accounts a ON a.id = et.account_id
-         JOIN users u ON u.id = a.user_id
-         JOIN caldav_sources cs ON cs.account_id = a.id
-         WHERE b.uid = ? AND b.status = 'confirmed' AND cs.id = ?",
+         JOIN users u ON u.id = COALESCE(b.assigned_user_id, a.user_id)
+         JOIN caldav_sources cs ON cs.id = ?
+         JOIN accounts sa ON sa.id = cs.account_id AND sa.user_id = u.id
+         WHERE b.uid = ? AND b.status = 'confirmed'
+           AND b.caldav_calendar_href = cs.write_calendar_href",
     )
-    .bind(uid)
     .bind(source_id)
+    .bind(uid)
     .fetch_optional(pool)
     .await
     .unwrap_or(None);
@@ -1158,14 +1161,26 @@ async fn cancel_orphaned_bookings(
     client: Option<&CaldavClient>,
     source_id: &str,
 ) {
+    // Scope by the calendar the event was actually pushed to, not by the
+    // event type owner's account: team bookings are written to the
+    // assigned member's calendar (#147), and sweeping them from the
+    // owner's source would auto-cancel bookings whose event simply hasn't
+    // been synced into `events` by the member's source yet. Hrefs are not
+    // globally unique across servers, so the source must also belong to
+    // the booking's effective host (assigned member, else owner). The uid
+    // lookup stays deliberately global: confirm-before-cancel is not
+    // available on every path, and a write calendar that is not among the
+    // synced ones must not read as "everything orphaned".
     let orphans: Vec<(String,)> = sqlx::query_as(
         "SELECT b.uid FROM bookings b
          JOIN event_types et ON et.id = b.event_type_id
          JOIN accounts a ON a.id = et.account_id
-         JOIN caldav_sources cs ON cs.account_id = a.id
-         WHERE cs.id = ?
-           AND b.status = 'confirmed'
+         JOIN caldav_sources cs ON cs.id = ?
+         JOIN accounts sa ON sa.id = cs.account_id
+                         AND sa.user_id = COALESCE(b.assigned_user_id, a.user_id)
+         WHERE b.status = 'confirmed'
            AND b.caldav_calendar_href IS NOT NULL
+           AND b.caldav_calendar_href = cs.write_calendar_href
            AND b.uid NOT IN (SELECT uid FROM events)",
     )
     .bind(source_id)

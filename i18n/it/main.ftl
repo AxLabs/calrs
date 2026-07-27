@@ -211,7 +211,7 @@ email-action-cancel-booking = Annulla prenotazione
 
 # Email: guest booking confirmation
 
-email-confirm-subject = Confermata: { $event } — { $date }
+email-confirm-subject = { $event } — { $date }
 email-confirm-greeting = Ciao { $name },
 email-confirm-headline = La tua prenotazione è confermata!
 email-confirm-ics-attached-plain = Un invito al calendario è in allegato.

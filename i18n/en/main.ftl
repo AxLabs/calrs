@@ -216,7 +216,9 @@ email-action-cancel-booking = Cancel booking
 
 # Email: guest booking confirmation
 
-email-confirm-subject = Confirmed: { $event } — { $date }
+# Kept to "event — date": Exchange titles the guest appointment after the
+# email Subject header, not the ICS SUMMARY (#157).
+email-confirm-subject = { $event } — { $date }
 email-confirm-greeting = Hi { $name },
 email-confirm-headline = Your booking has been confirmed!
 email-confirm-ics-attached-plain = A calendar invite is attached.

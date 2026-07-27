@@ -816,10 +816,10 @@ pub async fn send_guest_confirmation_ex(
         let email2 = Message::builder()
             .from(from.clone())
             .to(to2)
-            .subject(format!(
-                "Invite: {} \u{2014} {}",
-                details.event_title, details.date
-            ))
+            // Exchange titles the guest's appointment after the Subject
+            // header, not the ICS SUMMARY, so REQUEST emails keep a neutral
+            // "event, date" subject (#157).
+            .subject(format!("{} \u{2014} {}", details.event_title, details.date))
             .multipart(MultiPart::mixed().multipart(body2).singlepart(att2))?;
         if let Err(e) = send_email(config, email2).await {
             tracing::warn!(attendee = %attendee_email, error = %e, "failed to send attendee confirmation");
@@ -2292,8 +2292,9 @@ pub async fn send_guest_reschedule_notification(
     let email = Message::builder()
         .from(config.mailbox_from()?)
         .to(to)
+        // Neutral subject: Exchange uses it as the appointment title (#157).
         .subject(format!(
-            "Rescheduled: {} \u{2014} {}",
+            "{} \u{2014} {}",
             details.event_title, details.new_date
         ))
         .multipart(

@@ -143,6 +143,99 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 | SMTP via environment variables | 1.12.0 | Configure SMTP via `CALRS_SMTP_*` env vars instead of the database, useful for container deployments. Env vars take priority over the DB; partial config errors loudly |
 | SMTP implicit TLS (port 465) | 1.12.0 | New `tls_mode` column (`starttls`/`tls`) supports port 465 without the prior STARTTLS hang. Applies to both env-var and DB-configured SMTP |
 | Team event type permission cleanup | 1.12.0 | Personal event-type mutation routes can't be reached via team URLs and vice versa; centralised through `can_manage_event_type` / `find_manageable_event_type_by_slug` with 8 new regression tests covering the manageability matrix |
+| Microsoft Exchange (EWS) backend | 1.13.0 | On-prem Exchange 2013/2016/2019 via a minimal SOAP client behind the new `CalendarProvider` trait, with autodiscover and protocol-filtered presets |
+| Google Calendar (OAuth2) sources | 1.13.0 | Connect Google Calendar without an app password: admin-configured OAuth2 client, tokens encrypted at rest, proactive refresh |
+| Auto-generated meeting links | 1.13.0 | Jitsi room URLs built from pattern tokens per confirmed booking, or a webhook location type for bring-your-own providers |
+| Booking captcha | 1.13.0 | Opt-in self-hosted proof-of-work captcha (Cap) on booking pages, no third-party tracking, CSP rebuilt at runtime |
+| Embed system | 1.13.0 | `embed.js` with inline auto-sizing iframe, floating button, and element-click bindings; layout/theme/brand params |
+| `calrs config dump` | 1.13.0 | Full instance configuration as JSON (18 sections), secrets excluded by construction |
+| Private-host allowlist | 1.13.0 | `CALRS_ALLOW_PRIVATE_HOSTS` lets listed CalDAV/EWS hosts resolve to private IPs while the SSRF guard stays on for everything else |
+| Runtime SMTP configuration | 1.14.0 | Configure and test SMTP from the admin panel; env vars keep precedence, password encrypted at rest |
+| Runtime base URL + allowlist | 1.14.0 | Public base URL and private-host allowlist editable from the admin panel instead of env-only |
+| Shared bookable resources | 1.15.0 | Instance-level resources (demo lab, meeting rooms) backed by an ICS feed: busy resources block slots, reservations written back over CalDAV |
+| Per-resource team allowlists | 1.15.0 | Team admins attach allowlisted resources to their own team event types, enforced server-side |
+
+## [1.15.1] - 2026-08-02
+
+Patch release with three field-reported fixes on top of 1.15.0. No schema changes, no new features, no config changes.
+
+### Fixed
+
+- **Team reschedules reach the calendar again** (closes #159, PR #160, contributed by @hugo-fasone) - Rescheduling a booking on a team event type updated the database but pushed an ICS whose `ORGANIZER` was the event type owner, while the event had been created with the assigned member as organizer. Google CalDAV rejects an organizer change on an existing event with `403 Forbidden`, so the calendar silently kept the old time while guest and host were told the reschedule succeeded. The new `booking_host_identity` helper resolves the organizer from the booking itself (assigned member for round-robin, full roster for collective, owner for personal event types) and is applied to the guest reschedule, token approval, and dashboard approval paths. Follow-up on the availability side tracked in #166.
+- **No more black frame around themed embeds** (PR #165, contributed by @pycanis) - An inline embed pinned to `?theme=light` showed its light content inside a black frame for visitors whose OS is in dark mode (and vice versa): the `color-scheme` meta always advertised `light dark`, so the iframe canvas followed the OS instead of the pinned theme. The meta now follows the `?theme=` embed param; auto-themed embeds and regular pages are unchanged.
+- **Neutral subjects on guest emails carrying a calendar invite** (closes #157, PR #158) - Exchange iMIP processing titles the guest's calendar appointment after the email Subject rather than the ICS SUMMARY, so prefixes like "Confirmed:" leaked into the event title and bounced back in accept/decline replies. The three guest-facing emails that attach a `METHOD:REQUEST` ICS now use a plain "event, date" subject in all six locales; the confirmed/rescheduled wording stays in the email body.
+
+### Internal
+
+- 797 tests, all green (new regression test covering organizer resolution for assigned, collective, and personal bookings)
+
+## [1.15.0] - 2026-07-25
+
+The shared-resources release: attach instance-level bookable resources (a demo lab, meeting rooms) to your event types. A busy resource blocks the slot, confirmed bookings are reserved in the resource's own CalDAV calendar, and team admins manage attachments through per-resource allowlists. Plus a round of team booking fixes reported from the field.
+
+### Added
+
+- **Shared bookable resources** (#149, #152) - Resources are backed by a read-only ICS publish feed (BlueMind, Nextcloud, any iCalendar URL) and managed from the admin panel: feed validation, "Sync now", "Test write", sync-failure indicator. Two modes per event type: **all** (every resource must be free) and **round-robin** (least-loaded free resource is picked and shown on the booking). Reservation write-back into the resource's CalDAV collection prevents cross-event-type double-booking; reservations are released on cancel and reschedule
+- **Per-resource team allowlists** (#153) - Team admins attach allowlisted resources to their own team event types, enforced server-side
+- **CLI parity for resources** (#150) - `calrs event-type slots` consults resources, `calrs booking cancel` releases reservations and cleans the host calendar
+- New docs page: [Shared Resources](https://olivierlambert.github.io/calrs/docs/resources.html)
+
+### Fixed
+
+- **Write-back targets the right calendar** (#147) - Team bookings land on the assigned member's calendar, not the event type owner's. Collective mode is now fully implemented at booking time: it verifies every member, pushes to every member's calendar, and notifies every member. Reminders and the sync orphan sweep follow the same resolution
+- **Per-member slot capacity** (#146) - The double-booking guard is keyed per assigned member, so a round-robin team can take as many parallel bookings per slot as it has free members
+- **No more duplicate Fastmail invites** (#141, PR #155) - CalDAV write-back marks attendees `SCHEDULE-AGENT=CLIENT` (RFC 6638), so scheduling-aware servers no longer send their own UTC invitation on top of the calrs email
+
+### Internal
+
+- Migrations 058-061 (`resources`, `resource_sync_error`, `resource_teams`, `booking_unique_per_member`), applied automatically on startup
+- Thanks to Michael (3dreams-medienagentur) and Matthijs (@MatthijsZw) for the detailed reports and reproducible setups
+
+## [1.14.0] - 2026-06-22
+
+Configuration that used to require environment variables and a restart moves into the admin UI and the database. Environment variables still take precedence when set, so existing deployments are unaffected.
+
+### Added
+
+- **Editable SMTP config from the admin UI** (#139) - Configure and test your SMTP server from the panel, with explicit env/DB precedence. The password is encrypted at rest (AES-256-GCM) and uses the keep-current pattern on save
+- **Configurable base URL and private-host allowlist** (#140) - Set the public base URL and the private-host allowlist at runtime via DB/UI. Env vars still win when present, and the SSRF guard stays on by default (allowlist empty unless explicitly configured by an admin)
+
+### Fixed
+
+- Same-day calendar events are now detected in the busy-time check (#134)
+- Radicale calendars advertised with a spaced self-closing tag are now discovered (#135)
+
+### Internal
+
+- Migration 057 (`runtime_settings`), applied automatically on startup
+- 766 tests, all green
+
+## [1.13.0] - 2026-06-06
+
+The provider-expansion release: connecting a calendar no longer means CalDAV with basic auth. Microsoft Exchange (EWS) joins as a second backend behind a new provider trait, Google Calendar connects via OAuth2 with encrypted token storage, confirmed bookings can auto-generate video meeting links (Jitsi pattern or bring-your-own webhook), booking pages gain an opt-in self-hosted proof-of-work captcha, and an embed system lets you put your booking page on any website. Two headline features are community contributions.
+
+### Added
+
+- **Microsoft Exchange (EWS) backend** (PR #103) - On-prem Exchange 2013/2016/2019 support via a minimal SOAP client in `src/ews/` (autodiscover, GetFolder/FindItem/CreateItem/DeleteItem, iCal to EWS field mapping). A new provider factory in `src/providers/` abstracts CalDAV vs EWS behind a single `CalendarProvider` trait; the CalDAV path is unchanged. Source-add form gains a Backend dropdown with protocol-filtered presets
+- **Google Calendar (OAuth2) sources** (PR #99) - Admin configures the OAuth2 client ID/secret in the admin panel; users connect via "Add Google Calendar" on the sources page or `calrs source add-google`. Access and refresh tokens are stored AES-256-GCM encrypted and refreshed proactively five minutes before expiry
+- **Auto-generated video meeting links** (PR #128, phases 1+2 of #45) - New `Jitsi (auto-generated room)` location type: every confirmed booking gets a fresh URL built from pattern tokens (`{username}`, `{event}`, `{date}`, `{random}`; default `{event}-{random}`), configurable org-wide and overridable per event type. Plus a `Webhook (custom provider)` location type for bring-your-own providers: calrs POSTs booking details and uses the returned URL
+- **Booking captcha** (PR #122, contributed by @florian-SV) - Opt-in [Cap](https://trycap.dev) integration: self-hosted proof-of-work captcha on booking pages, no third-party tracking. Without configuration the booking flow is byte-for-byte unchanged. The Cap secret is encrypted at rest, and the CSP is rebuilt in memory on every admin save, scoped to booking form pages only
+- **Embed code generator** (PR #125) - Cal.com-style embed system: a self-contained `embed.js` exposes `Calrs.inline` (auto-sizing iframe), `Calrs.floatingButton` (corner pill + modal), and `Calrs.elementClick` (data-attribute binding). `?embed=1` strips navigation chrome, autosizes via `calrs:resize` postMessages, accepts layout/theme/brand params, and switches the CSRF cookie to `SameSite=None; Secure` so cross-origin iframes work
+- **`calrs config dump`** (PR #112, contributed by @mvalois) - Dumps the full instance configuration as JSON (`--pretty` supported): 18 sections plus a top-level `schema_version`. Secrets and operational sync state are excluded by construction, with tests asserting they never appear
+- **`CALRS_ALLOW_PRIVATE_HOSTS`** (PR #124, closes #123) - Opt-in, comma-separated, exact-match allowlist letting specific CalDAV/EWS hosts resolve to private/reserved IPs (docker-compose stacks, self-hosted Exchange behind private addressing). The SSRF guard stays active for every non-listed host. Reported and verified by @aburg
+
+### Fixed
+
+- **Google sync silently truncating the forward window** (PR #99) - An unfiltered `calendar-query` REPORT left future events out of the local cache, making booked days look available. The full-fetch path now sends an RFC 4791 `time-range` filter with a 90-day lookback, falling back to the unfiltered REPORT for servers that reject it; orphan cleanup is scoped to the same window so pre-window history is preserved
+- **CalDAV write-back no longer gated on SMTP** (PR #99) - All four guest booking handlers previously wrapped the CalDAV push inside an SMTP-config check, so bookings on instances without SMTP never reached the host's calendar. Confirmed bookings now push unconditionally; only email sends remain gated on SMTP. A dashboard warning surfaces when sources are enabled but none have a write target
+- **EWS: timed UTC events, all-day date offset, recurring series** (PR #127) - Follow-up correctness pass on the EWS backend
+- **Friendly email validation on booking forms** (PR #129) - Incomplete addresses like `user@domain` (no TLD) pass HTML5 validation but failed server-side with a bare error page; guests now get a proper inline error
+
+### Internal
+
+- Migrations 053-056 (`oauth2_caldav`, `captcha`, `provider_type`, `meeting_links`)
+- Translation updates from Weblate (PR #131)
+- 758 tests, all green (up from 677 in 1.12.1)
 
 ## [1.12.1] - 2026-05-26
 

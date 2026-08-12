@@ -97,7 +97,8 @@ calrs/
 │   ├── 056_meeting_links.sql     ← jitsi + webhook meeting-provider columns on auth_config
 │   ├── 057_runtime_settings.sql  ← base_url + allow_private_hosts on auth_config (env-overridable runtime settings)
 │   ├── 058_resources.sql         ← shared resources: resources, resource_events, event_type_resources; resource_scheduling_mode, assigned_resource_id, lend_resource_write
-│   └── 059_resource_sync_error.sql ← last_sync_error on resources (feed failure indicator)
+│   ├── 059_resource_sync_error.sql ← last_sync_error on resources (feed failure indicator)
+│   └── 062_sms_notifications.sql ← SMS: guest_phone on bookings, sms_notifications_enabled on event_types, sms_config table
 ├── templates/
 │   ├── base.html                 ← base layout + CSS (light/dark mode)
 │   ├── dashboard_base.html       ← sidebar layout (extends base.html, all dashboard pages extend this)
@@ -151,6 +152,15 @@ calrs/
     │                               mode merge (all/round_robin), booking-time check
     ├── rrule.rs                  ← RRULE expansion (DAILY/WEEKLY/MONTHLY, EXDATE, BYDAY)
     ├── settings.rs               ← runtime settings (base_url, allow_private_hosts): env-overrides-DB, process-global cache
+    ├── sms/                      ← SMS notifications, provider-agnostic
+    │   ├── mod.rs                ← SmsProvider trait, SmsError/SendReceipt, config load (env + DB), notify_guest()
+    │   ├── factory.rs            ← provider kinds, ProviderSpec registry (drives the admin form), validate_config()
+    │   ├── phone.rs              ← E.164 normalisation + country calling codes
+    │   ├── message.rs            ← localised bodies (Fluent) + GSM-7 segment estimation
+    │   ├── twilio.rs             ← Twilio adapter
+    │   ├── gatewayapi.rs         ← GatewayApi adapter (.com / .eu regions)
+    │   ├── sevenio.rs            ← seven.io adapter (HTTP 200 + in-body error codes)
+    │   └── webhook.rs            ← generic webhook adapter (bring your own gateway, HMAC-signed)
     ├── utils.rs                  ← shared utilities: split_vevents(), extract_vevent_field()
     ├── caldav/
     │   └── mod.rs                ← CalDAV client: discovery, calendar list, event fetch, write-back
@@ -445,6 +455,26 @@ Because `--surface`, `--border`, etc. are already overridden by `html.dark { ...
 **CLI:** `calrs resource probe --url <URL> [--username U] [--write-test]` probes a feed or CalDAV collection (full RFC 4791 discovery fallback, write test with a temporary event). Known gap: `calrs event-type slots` and `calrs booking create` do not consult resources yet; the web paths do.
 
 **Files:** `src/resources.rs` (core logic + tests), `src/web/mod.rs` (admin handlers, booking wiring, write-back), `src/commands/resource.rs` (probe CLI), `migrations/058_resources.sql`, `templates/admin.html`, `templates/event_type_form.html`, `templates/settings.html`, `templates/troubleshoot.html`.
+
+---
+
+## SMS notifications
+
+**Concept:** optional text-message notifications to the guest, opt-in per event type. Off by default twice over: with no `sms_config` row *and* no event type setting `sms_notifications_enabled`, nothing in `src/sms/` ever runs and the booking flow is byte-for-byte what it was.
+
+**Provider abstraction:** `SmsProvider` (in `src/sms/mod.rs`) is the same shape as `CalendarProvider` in `providers/`: an object-safe async trait with `send(to, body)` and an optional `check()`, plus a `factory.rs` that dispatches on `sms_config.provider`. Four adapters ship: `twilio`, `gatewayapi`, `sevenio`, and `webhook` (POSTs `{"to","text","sender"}` to any URL, optionally HMAC-signed like the meeting webhook, so a gateway with no adapter is a small script away).
+
+Adapters own request building **and** response parsing, because "the credentials are wrong" looks different on every gateway: HTTP 401 on Twilio, HTTP 401 with a `{"code": "0x0213"}` body on GatewayAPI, and HTTP **200** carrying `{"success": "900"}` on seven.io. Each maps onto `SmsError` (`Auth`, `InvalidRecipient`, `InvalidSender`, `InsufficientCredit`, `RateLimited`, `Transport`, `Other`) so the admin panel and the logs read the same whichever gateway is configured. `parse_error`/`parse_response` are pure functions, unit-tested against the payloads in each vendor's docs, no mock server involved.
+
+**Config** (migration 062, `sms_config`): a singleton row with `provider`, `api_key` (non-secret identifier, Twilio's Account SID; NULL elsewhere), `api_secret_enc` (AES-256-GCM), `sender`, `base_url` (region or self-hosted endpoint; the target URL for `webhook`), `default_country_code`, `enabled`. The `CALRS_SMS_*` block (`PROVIDER`, `API_KEY`, `API_SECRET`, `SENDER`, `BASE_URL`, `DEFAULT_COUNTRY_CODE`) overrides the DB with the same "full block wins" semantics as `CALRS_SMTP_*`, and locks the admin form when active. `factory::validate_config()` is the single gate used by the admin form, the env block, and the read path, so a row that cannot send is treated as "not configured" rather than failing inside a booking request.
+
+**Admin UI:** one SMS card, not one per vendor. A provider `<select>` plus four inputs whose labels, hints, and required-ness come from `factory::PROVIDER_SPECS`; hidden blocks are `disabled` so only the selected gateway's values are submitted. "Test gateway" sends a real message, or verifies the credentials for free when the recipient is left empty and the gateway has a check endpoint (Twilio `GET /Accounts/{SID}.json`, seven.io `GET /api/balance`). Adding a gateway means one adapter file and one `ProviderSpec` entry: no template change.
+
+**What gets sent:** guest-facing only, on four events (`SmsEvent`): `Confirmed` (or, for `requires_confirmation` event types, when the host approves), `Cancelled` (host or guest), `Rescheduled`, and `Reminder` (the `run_reminder_loop` background task). Hosts have no phone field. Sends are best-effort and inline, like the emails they accompany: failures are logged and never block a booking. The reminder loop no longer skips its batch when SMTP is unconfigured, so an SMS-only deployment still gets reminders out.
+
+**Bodies** are composed in `message.rs` from the `sms-*` Fluent keys in the booking's own language, never in the provider. SMS is billed per 160-character GSM-7 segment, and one character outside GSM-7 (a Polish `ł`, a curly quote) drops that to 70, so keep those keys terse: `estimate_segments()` backs a test asserting every shipped body in every shipped language stays within two segments. Host-controlled event titles are shortened to 60 characters so the date and time always survive.
+
+**Phone numbers:** the guest types whatever they like (`06 12 34 56 78`, `0033612345678`, `+33 6 12 34 56 78`); `phone::normalize()` converts to E.164 server-side using the configured default country code, and `bookings.guest_phone` is E.164 from then on. This is not libphonenumber: it handles trunk and international prefixes and leaves real validity to the gateway. Numbers are shown to the host on the bookings dashboard and never to other guests.
 
 ---
 

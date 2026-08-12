@@ -443,7 +443,7 @@
       <input type="checkbox" name="sms_notifications_enabled" {% if form_sms_notifications_enabled %}checked{% endif %} style="accent-color: var(--accent); width: 1.125rem; height: 1.125rem;">
       <div>
         <strong style="font-size: 0.925rem;">SMS notifications</strong>
-        <div style="color: var(--text-muted); font-size: 0.825rem;">Adds an optional phone number field to the booking form and sends SMS updates via Twilio, in addition to email. Requires Twilio to be configured in the admin panel.</div>
+        <div style="color: var(--text-muted); font-size: 0.825rem;">Adds an optional phone number field to the booking form and texts the guest when their booking is confirmed, moved, cancelled, or about to start, in addition to email. Requires an SMS gateway configured in the admin panel.</div>
       </div>
     </label>
 

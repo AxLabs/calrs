@@ -145,9 +145,9 @@ pub struct EventType {
     /// `None` or `Some(0)` means no restriction.
     pub reschedule_notice_min: Option<i32>,
     /// Opt-in: when true, the booking form shows an optional phone number
-    /// field and SMS notifications (via Twilio) are sent for this event
-    /// type's bookings, in addition to email. Defaults to false so existing
-    /// event types are unaffected.
+    /// field and SMS notifications are sent for this event type's bookings,
+    /// in addition to email. Defaults to false so existing event types are
+    /// unaffected. The gateway used is instance-wide (see `sms_config`).
     pub sms_notifications_enabled: bool,
 }
 
@@ -203,7 +203,7 @@ pub struct Booking {
     pub assigned_user_id: Option<String>,
     /// Optional guest phone number in E.164 format (e.g. `+15551234567`),
     /// collected only when the event type has SMS notifications enabled.
-    pub phone_number: Option<String>,
+    pub guest_phone: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]

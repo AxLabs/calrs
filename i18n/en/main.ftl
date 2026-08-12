@@ -75,6 +75,12 @@ book-additional-guests-label = Additional guests
 book-additional-guests-hint = (optional, up to { $max })
 book-add-guest-btn = + Add guest email
 book-guest-email-placeholder = colleague@example.com
+book-phone-label = Phone number
+book-phone-hint = (optional, for SMS updates)
+book-phone-placeholder = 06 12 34 56 78
+book-phone-help = Local numbers are fine; { $country } is assumed unless you start with +.
+book-phone-invalid-title = Invalid phone number
+book-phone-invalid = Please enter a phone number we can text, or leave the field empty.
 captcha-label = Security verification
 captcha-initial-state = Verify you're human
 captcha-verifying = Verifying...
@@ -88,6 +94,17 @@ captcha-verified-aria = Verified
 captcha-required = Please verify you're human
 captcha-error-aria = An error occurred, please try again
 book-confirm-button = Confirm booking
+
+# SMS notifications (src/sms/message.rs).
+#
+# These are text messages, billed per 160-character segment (70 if the text
+# contains any character outside the GSM-7 alphabet, which includes most
+# accented letters). Keep them short and plain.
+
+sms-confirmed = Booking confirmed: { $event }, { $date } at { $time } ({ $tz }).
+sms-cancelled = Booking cancelled: { $event }, { $date } at { $time } ({ $tz }).
+sms-rescheduled = Booking moved: { $event } is now { $date } at { $time } ({ $tz }).
+sms-reminder = Reminder: { $event } starts { $date } at { $time } ({ $tz }).
 
 # Shared labels used across the cancel / decline / approve / reschedule / claim flows
 

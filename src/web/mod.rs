@@ -15728,6 +15728,8 @@ async fn admin_dashboard(
             sms_supports_check => crate::sms::factory::provider_spec(&sms_provider)
                 .map(|spec| spec.supports_check)
                 .unwrap_or(false),
+            sms_trial_mode => sms_provider == crate::sms::kinds::TWILIO
+                && crate::sms::twilio::trial_mode_enabled(),
             sms_providers => crate::sms::PROVIDER_SPECS,
             sms_country_codes => crate::sms::phone::COUNTRY_CODES
                 .iter()

@@ -12,11 +12,43 @@ use async_trait::async_trait;
 
 use super::{factory, SendReceipt, SmsConfig, SmsError, SmsProvider};
 
+/// Twilio-provided template used in trial mode, picked from the list at
+/// <https://www.twilio.com/docs/usage/trials/try-out-sms> as the closest in
+/// meaning to what calrs actually sends.
+const TRIAL_TEMPLATE: &str = "sms_appointment_reminders";
+
+/// Switch for [trial mode](trial_mode_enabled), read from the environment only.
+const TRIAL_ENV_VAR: &str = "CALRS_SMS_TWILIO_TRIAL";
+
+/// Whether to send Twilio's predefined template instead of the real message.
+///
+/// Twilio trial accounts refuse custom message bodies outright: `Body` has to
+/// carry the *name* of one of their predefined templates. That makes the whole
+/// Twilio path untestable without a paid account, which is a poor deal for a
+/// contributor who just wants to check that a booking reaches a phone.
+///
+/// Deliberately environment-only, and deliberately not part of the
+/// `CALRS_SMS_*` block (it composes with a database-stored config too). An
+/// `sms_config` column or an admin field would let an operator flip it and
+/// quietly ship canned templates to real guests; turning it on has to be an act
+/// of whoever runs the process. `CALRS_SMS_<PROVIDER>_<OPTION>` is the shape to
+/// follow for any future gateway-specific extra.
+pub fn trial_mode_enabled() -> bool {
+    matches!(
+        std::env::var(TRIAL_ENV_VAR)
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
 pub struct TwilioProvider {
     account_sid: String,
     auth_token: String,
     from: String,
     base_url: String,
+    trial: bool,
 }
 
 impl TwilioProvider {
@@ -26,7 +58,22 @@ impl TwilioProvider {
             auth_token: config.api_secret.clone(),
             from: config.sender.trim().to_string(),
             base_url: factory::base_url(config),
+            trial: trial_mode_enabled(),
         }
+    }
+}
+
+/// The value to put in Twilio's `Body` parameter.
+///
+/// A substitution rather than an extra parameter, because that is what the
+/// trial API asks for: the request keeps the same `To`/`From`/`Body` shape on
+/// both paths, so the response, and therefore [`SendReceipt`] parsing, is
+/// identical whether or not trial mode is on.
+fn request_body(trial: bool, body: &str) -> &str {
+    if trial {
+        TRIAL_TEMPLATE
+    } else {
+        body
     }
 }
 
@@ -42,6 +89,39 @@ struct MessageResponse {
 struct ErrorResponse {
     code: Option<i64>,
     message: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct AccountResponse {
+    #[serde(rename = "type")]
+    account_type: Option<String>,
+}
+
+/// Guard the one way trial mode can cost money instead of saving it.
+///
+/// On a trial account `Body` must name a template. On a full account that same
+/// value is just text, so a flag left set after the account is upgraded texts
+/// every guest the literal string `sms_appointment_reminders`, at full price,
+/// instead of their booking details. The credential check already fetches the
+/// account, so it can say so without spending anything.
+///
+/// The opposite mistake (a trial account with the flag off) needs no guard
+/// here: it fails closed at send time with Twilio's own refusal, which
+/// [`parse_error`] already surfaces.
+fn trial_mismatch(trial: bool, account_json: &str) -> Option<SmsError> {
+    if !trial {
+        return None;
+    }
+    let parsed: AccountResponse = serde_json::from_str(account_json).ok()?;
+    match parsed.account_type.as_deref() {
+        Some("Full") => Some(SmsError::Other(format!(
+            "{} is set but this is a full Twilio account, not a trial one. \
+             Guests would receive the literal text \"{}\" instead of their booking \
+             details, and you would be billed for it. Unset the variable.",
+            TRIAL_ENV_VAR, TRIAL_TEMPLATE
+        ))),
+        _ => None,
+    }
 }
 
 /// Map an HTTP status plus Twilio's JSON error body onto a normalised error.
@@ -85,7 +165,24 @@ impl SmsProvider for TwilioProvider {
             "{}/2010-04-01/Accounts/{}/Messages.json",
             self.base_url, self.account_sid
         );
-        let params = [("To", to), ("From", self.from.as_str()), ("Body", body)];
+        if self.trial {
+            // Loud on purpose: with the template substituted, all four
+            // SmsEvent kinds look identical on the handset, so the log is the
+            // only place a tester can tell which one fired. The composed body
+            // is still built and logged, which keeps message.rs on the
+            // exercised path in the only mode most contributors can run.
+            tracing::warn!(
+                template = TRIAL_TEMPLATE,
+                "Twilio trial mode is on; sending a predefined template instead of the composed message"
+            );
+            tracing::debug!(body = %body, "composed SMS body (replaced by the trial template)");
+        }
+
+        let params = [
+            ("To", to),
+            ("From", self.from.as_str()),
+            ("Body", request_body(self.trial, body)),
+        ];
 
         let response = super::http_client()
             .post(&url)
@@ -135,11 +232,15 @@ impl SmsProvider for TwilioProvider {
             .map_err(|e| SmsError::Transport(e.to_string()))?;
 
         let status = response.status();
-        if status.is_success() {
-            return Ok(());
-        }
         let text = response.text().await.unwrap_or_default();
-        Err(parse_error(status.as_u16(), &text))
+        if !status.is_success() {
+            return Err(parse_error(status.as_u16(), &text));
+        }
+
+        match trial_mismatch(self.trial, &text) {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 
@@ -174,6 +275,37 @@ mod tests {
         ));
         assert!(matches!(parse_error(429, "{}"), SmsError::RateLimited(_)));
         assert!(matches!(parse_error(503, "{}"), SmsError::Transport(_)));
+    }
+
+    #[test]
+    fn trial_mode_substitutes_the_predefined_template() {
+        let composed = "Your booking is confirmed for 3 Sep at 14:00 (Europe/Paris).";
+        assert_eq!(request_body(false, composed), composed);
+        assert_eq!(request_body(true, composed), TRIAL_TEMPLATE);
+        // Trial accounts match the template name exactly; a body that merely
+        // contains it is still a custom body and would be refused.
+        assert_eq!(TRIAL_TEMPLATE, "sms_appointment_reminders");
+    }
+
+    #[test]
+    fn trial_mode_on_a_full_account_is_refused() {
+        let full = r#"{"sid": "AC123", "status": "active", "type": "Full"}"#;
+        let trial = r#"{"sid": "AC123", "status": "active", "type": "Trial"}"#;
+
+        // The expensive mistake: the flag outliving the trial account.
+        assert!(matches!(
+            trial_mismatch(true, full),
+            Some(SmsError::Other(_))
+        ));
+        assert!(trial_mismatch(true, trial).is_none());
+
+        // With trial mode off, the account type is none of our business.
+        assert!(trial_mismatch(false, full).is_none());
+
+        // An unparseable or unexpected payload must not turn a working
+        // credential check into a failure.
+        assert!(trial_mismatch(true, "not json").is_none());
+        assert!(trial_mismatch(true, "{}").is_none());
     }
 
     #[test]

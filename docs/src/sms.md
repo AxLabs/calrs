@@ -69,6 +69,24 @@ Like SMTP, the whole configuration can come from the environment instead, which 
 
 The block is all-or-nothing: an incomplete set is ignored with a warning in the logs and calrs falls back to the database configuration, so a typo in a deployment unit cannot half-configure the gateway.
 
+### Testing against a Twilio trial account
+
+Twilio trial accounts refuse custom message bodies: `Body` has to carry the *name* of one of Twilio's predefined templates instead. Without a way around that, checking the Twilio path at all means holding a paid account, which is a lot to ask of someone who just wants to confirm that a booking reaches a phone.
+
+Setting `CALRS_SMS_TWILIO_TRIAL=true` sends Twilio's `sms_appointment_reminders` template in place of the composed message. Everything else runs unchanged, so the credentials, the sender, the recipient normalisation, the response parsing, and all four booking events are exercised against the real API. The composed message is still built, and logged at debug level, so nothing about it goes untested.
+
+This is a testing aid, not a deployment option:
+
+- It is read from the environment only. There is no database column and no admin field, so it cannot be switched on from the panel and left on by accident.
+- It sits outside the all-or-nothing `CALRS_SMS_*` block and is read on its own, so it works with a database-stored configuration too.
+- The admin SMS card shows a warning while it is active, and every send logs one. All four events look identical on the handset once the template is substituted, so the log is the only place to tell them apart.
+- **Test gateway** with the recipient left empty refuses outright if the variable is set on a full account. That is the one way this can cost money rather than save it: on a paid account the template name is just text, so a flag left set after an upgrade would text every guest the literal string `sms_appointment_reminders` at full price.
+- Trial accounts only reach numbers verified in the Twilio console, up to five of them.
+
+Unset the variable, or set it to anything other than `1`/`true`/`yes`/`on`, to go back to real message bodies.
+
+Gateway-specific switches follow `CALRS_SMS_<PROVIDER>_<OPTION>`.
+
 ## Enabling SMS on an event type
 
 Each event type has an **SMS notifications** setting with three values:

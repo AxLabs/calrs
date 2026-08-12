@@ -751,6 +751,12 @@ document.querySelectorAll('input[type="color"]').forEach(function(picker) {
   <p style="color: var(--error-text); font-size: 0.875rem;">✗ {{ sms_test_detail or "The SMS gateway refused the request." }}</p>
   {% endif %}
 
+  {% if sms_trial_mode %}
+  <p style="color: var(--error-text); font-size: 0.85rem; border: 1px solid var(--error-text); border-radius: 6px; padding: 0.625rem 0.875rem;">
+    <strong>Twilio trial mode is on</strong> (<code>CALRS_SMS_TWILIO_TRIAL</code>). Guests receive Twilio's predefined <code>sms_appointment_reminders</code> template, not the real message, and only numbers verified in your Twilio console will be reached. This is a testing aid for trial accounts. Unset the variable before taking bookings.
+  </p>
+  {% endif %}
+
   {% if sms_configured and not captcha_configured %}
   <p style="color: var(--error-text); font-size: 0.85rem; border: 1px solid var(--error-text); border-radius: 6px; padding: 0.625rem 0.875rem;">
     The booking form is public and the recipient number comes from the guest, so SMS without a captcha is an open relay someone else can bill you for. Configure the captcha above, and restrict destination countries in your gateway's own settings.

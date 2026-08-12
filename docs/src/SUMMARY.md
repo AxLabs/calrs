@@ -11,6 +11,7 @@
 - [Booking Flow](./booking-flow.md)
 - [Teams](./teams.md)
 - [Shared Resources](./resources.md)
+- [SMS Notifications](./sms.md)
 - [Authentication](./authentication.md)
 
 # Administration

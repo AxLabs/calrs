@@ -531,8 +531,8 @@ pub async fn run_reminder_loop(pool: SqlitePool, secret_key: [u8; 32]) {
             // joined into `due` above: sqlx only derives FromRow for tuples up
             // to 16 elements, and that one is already at the limit.
             if sms_configured {
-                let sms_target: Option<(Option<String>, bool)> = sqlx::query_as(
-                    "SELECT b.guest_phone, et.sms_notifications_enabled FROM bookings b
+                let sms_target: Option<(Option<String>, String)> = sqlx::query_as(
+                    "SELECT b.guest_phone, et.sms_phone_mode FROM bookings b
                      JOIN event_types et ON et.id = b.event_type_id WHERE b.id = ?",
                 )
                 .bind(bid)
@@ -540,10 +540,12 @@ pub async fn run_reminder_loop(pool: SqlitePool, secret_key: [u8; 32]) {
                 .await
                 .unwrap_or(None);
 
-                if let Some((phone, sms_enabled)) = sms_target {
-                    if let Some(ctx) =
-                        crate::sms::SmsContext::for_booking(&details, phone.as_deref(), sms_enabled)
-                    {
+                if let Some((phone, phone_mode)) = sms_target {
+                    if let Some(ctx) = crate::sms::SmsContext::for_booking(
+                        &details,
+                        phone.as_deref(),
+                        crate::sms::collects_phone(&phone_mode),
+                    ) {
                         crate::sms::notify_guest(
                             &pool,
                             &secret_key,
@@ -1443,6 +1445,7 @@ pub async fn create_router(pool: SqlitePool, data_dir: PathBuf, secret_key: [u8;
         .route("/dashboard/admin/sms", post(admin_update_sms))
         .route("/dashboard/admin/sms/test", post(admin_update_sms_test))
         .route("/dashboard/admin/sms/clear", post(admin_update_sms_clear))
+        .route("/dashboard/admin/sms/policy", post(admin_update_sms_policy))
         .route("/dashboard/admin/jitsi", post(admin_update_jitsi))
         .route(
             "/dashboard/admin/meeting-webhook",
@@ -1536,6 +1539,7 @@ pub async fn create_router(pool: SqlitePool, data_dir: PathBuf, secret_key: [u8;
             "/booking/cancel/{token}",
             get(guest_cancel_form).post(guest_cancel_booking),
         )
+        .route("/booking/ics/{token}", get(booking_ics))
         .route(
             "/booking/reschedule/{token}",
             get(guest_reschedule_slots).post(guest_reschedule_booking),
@@ -2025,13 +2029,13 @@ async fn dashboard_bookings(
     .await
     .unwrap_or_default();
 
-    let upcoming_bookings: Vec<(String, String, String, Option<String>, String, String, String, i32, String, String, String, bool)> =
+    let upcoming_bookings: Vec<(String, String, String, Option<String>, String, String, String, i32, String, String, String, String)> =
         sqlx::query_as(
             "SELECT b.id, b.guest_name, b.guest_email, b.guest_phone, b.start_at, b.end_at, et.title, b.reschedule_by_host,
                     COALESCE(NULLIF(et.timezone, ''), u.timezone) AS stored_tz,
                     COALESCE(NULLIF(b.guest_timezone, ''), 'UTC') AS guest_tz,
                     COALESCE(r.name, '') AS resource_name,
-                    et.sms_notifications_enabled
+                    et.sms_phone_mode
          FROM bookings b
          JOIN event_types et ON et.id = b.event_type_id
          JOIN accounts a ON a.id = et.account_id
@@ -2130,7 +2134,7 @@ async fn dashboard_bookings(
                 stored_tz,
                 guest_tz,
                 resource_name,
-                sms_enabled,
+                sms_phone_mode,
             )| {
                 let (primary, secondary) =
                     format_booking_for_dashboard(start, end, stored_tz, host_tz, guest_tz);
@@ -2138,7 +2142,7 @@ async fn dashboard_bookings(
                     id => id,
                     guest_name => name,
                     guest_email => email,
-                    guest_phone => if *sms_enabled { phone.as_deref().unwrap_or("") } else { "" },
+                    guest_phone => if crate::sms::collects_phone(sms_phone_mode) { phone.as_deref().unwrap_or("") } else { "" },
                     start_at => primary,
                     start_at_guest => secondary,
                     event_title => title,
@@ -4247,10 +4251,10 @@ async fn cancel_booking(
         String,
         String,
         Option<String>,
-        bool,
+        String,
         Option<String>,
     )> = sqlx::query_as(
-        "SELECT b.id, b.uid, b.guest_name, b.guest_email, b.start_at, b.end_at, et.title, et.id, COALESCE(b.guest_timezone, 'UTC'), b.status, b.guest_phone, et.sms_notifications_enabled, b.language
+        "SELECT b.id, b.uid, b.guest_name, b.guest_email, b.start_at, b.end_at, et.title, et.id, COALESCE(b.guest_timezone, 'UTC'), b.status, b.guest_phone, et.sms_phone_mode, b.language
              FROM bookings b
              JOIN event_types et ON et.id = b.event_type_id
              JOIN accounts a ON a.id = et.account_id
@@ -4274,7 +4278,7 @@ async fn cancel_booking(
         guest_timezone,
         prev_status,
         guest_phone,
-        sms_notifications_enabled,
+        sms_phone_mode,
         guest_language,
     ) = match booking {
         Some(b) => b,
@@ -4346,7 +4350,7 @@ async fn cancel_booking(
     if let Some(ctx) = crate::sms::SmsContext::for_cancellation(
         &details,
         guest_phone.as_deref(),
-        sms_notifications_enabled,
+        crate::sms::collects_phone(&sms_phone_mode),
     ) {
         crate::sms::notify_guest(
             &state.pool,
@@ -4587,7 +4591,7 @@ struct EventTypeForm {
     #[serde(default)]
     min_notice_min: String,
     requires_confirmation: Option<String>, // checkbox: "on" or absent
-    sms_notifications_enabled: Option<String>, // checkbox: "on" or absent
+    sms_phone_mode: Option<String>,        // checkbox: "on" or absent
     visibility: Option<String>,            // "public", "internal", or "private"
     location_type: Option<String>, // "link", "phone", "in_person", "custom", "jitsi_auto", "webhook_auto"
     location_value: Option<String>,
@@ -4923,6 +4927,7 @@ async fn new_event_type_form(
             selected_calendar_ids => "",
             resources_all => resources_all,
             can_manage_resources => auth_user.user.role == "admin",
+            can_enable_sms => can_enable_sms(&state.pool, &auth_user.user).await,
             selected_resource_ids => selected_resource_ids,
             resource_scheduling_mode => resource_scheduling_mode,
             form_title => "",
@@ -5051,7 +5056,8 @@ async fn create_event_type(
 
     let et_id = uuid::Uuid::new_v4().to_string();
     let requires_confirmation = form.requires_confirmation.as_deref() == Some("on");
-    let sms_notifications_enabled = form.sms_notifications_enabled.as_deref() == Some("on");
+    let sms_phone_mode =
+        resolve_phone_mode(&state.pool, user, form.sms_phone_mode.as_deref(), None).await;
 
     let location_type = form.location_type.as_deref().unwrap_or("link");
     let location_value = form
@@ -5125,7 +5131,7 @@ async fn create_event_type(
         .map(str::to_string);
 
     let _ = sqlx::query(
-        "INSERT INTO event_types (id, account_id, slug, title, description, duration_min, slot_interval_min, buffer_before, buffer_after, min_notice_min, requires_confirmation, location_type, location_value, team_id, created_by_user_id, reminder_minutes, visibility, max_additional_guests, default_calendar_view, first_slot_only, timezone, cancel_notice_min, reschedule_notice_min, meeting_pattern_override, sms_notifications_enabled)
+        "INSERT INTO event_types (id, account_id, slug, title, description, duration_min, slot_interval_min, buffer_before, buffer_after, min_notice_min, requires_confirmation, location_type, location_value, team_id, created_by_user_id, reminder_minutes, visibility, max_additional_guests, default_calendar_view, first_slot_only, timezone, cancel_notice_min, reschedule_notice_min, meeting_pattern_override, sms_phone_mode)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&et_id)
@@ -5152,7 +5158,7 @@ async fn create_event_type(
     .bind(cancel_notice_min)
     .bind(reschedule_notice_min)
     .bind(&meeting_pattern_override)
-    .bind(sms_notifications_enabled as i32)
+    .bind(&sms_phone_mode)
     .execute(&state.pool)
     .await;
 
@@ -5549,6 +5555,7 @@ async fn edit_event_type_form(
             selected_calendar_ids => selected_calendar_ids,
             resources_all => resources_all,
             can_manage_resources => auth_user.user.role == "admin",
+            can_enable_sms => can_enable_sms(&state.pool, &auth_user.user).await,
             selected_resource_ids => selected_resource_ids2,
             resource_scheduling_mode => resource_scheduling_mode,
             form_title => et_title,
@@ -5560,17 +5567,14 @@ async fn edit_event_type_form(
             form_buffer_after => buf_after,
             form_min_notice => min_notice,
             form_requires_confirmation => requires_conf != 0,
-            form_sms_notifications_enabled => {
-                sqlx::query_scalar::<_, Option<i32>>(
-                    "SELECT sms_notifications_enabled FROM event_types WHERE id = ?",
-                )
-                .bind(&et_id)
-                .fetch_optional(&state.pool)
-                .await
-                .unwrap_or(None)
-                .flatten()
-                .unwrap_or(0) != 0
-            },
+            form_sms_phone_mode => sqlx::query_scalar::<_, String>(
+                "SELECT sms_phone_mode FROM event_types WHERE id = ?",
+            )
+            .bind(&et_id)
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap_or(None)
+            .unwrap_or_else(|| crate::sms::phone_mode::OFF.to_string()),
             form_visibility => visibility,
             form_location_type => loc_type,
             form_location_value => loc_value.unwrap_or_default(),
@@ -5641,7 +5645,13 @@ async fn update_event_type(
 
     let new_slug = form.slug.trim().to_lowercase().replace(' ', "-");
     let requires_confirmation = form.requires_confirmation.as_deref() == Some("on");
-    let sms_notifications_enabled = form.sms_notifications_enabled.as_deref() == Some("on");
+    let sms_phone_mode = resolve_phone_mode(
+        &state.pool,
+        user,
+        form.sms_phone_mode.as_deref(),
+        Some(&et_id),
+    )
+    .await;
     let visibility = match form.visibility.as_deref().unwrap_or("public") {
         v @ ("public" | "internal" | "private") => v.to_string(),
         _ => "public".to_string(),
@@ -5720,7 +5730,7 @@ async fn update_event_type(
         .map(str::to_string);
 
     let _ = sqlx::query(
-        "UPDATE event_types SET slug = ?, title = ?, description = ?, duration_min = ?, slot_interval_min = ?, buffer_before = ?, buffer_after = ?, min_notice_min = ?, requires_confirmation = ?, location_type = ?, location_value = ?, reminder_minutes = ?, visibility = ?, max_additional_guests = ?, scheduling_mode = ?, default_calendar_view = ?, first_slot_only = ?, timezone = ?, cancel_notice_min = ?, reschedule_notice_min = ?, meeting_pattern_override = ?, sms_notifications_enabled = ? WHERE id = ?",
+        "UPDATE event_types SET slug = ?, title = ?, description = ?, duration_min = ?, slot_interval_min = ?, buffer_before = ?, buffer_after = ?, min_notice_min = ?, requires_confirmation = ?, location_type = ?, location_value = ?, reminder_minutes = ?, visibility = ?, max_additional_guests = ?, scheduling_mode = ?, default_calendar_view = ?, first_slot_only = ?, timezone = ?, cancel_notice_min = ?, reschedule_notice_min = ?, meeting_pattern_override = ?, sms_phone_mode = ? WHERE id = ?",
     )
     .bind(&new_slug)
     .bind(form.title.trim())
@@ -5743,7 +5753,7 @@ async fn update_event_type(
     .bind(cancel_notice_min)
     .bind(reschedule_notice_min)
     .bind(&meeting_pattern_override)
-    .bind(sms_notifications_enabled as i32)
+    .bind(&sms_phone_mode)
     .bind(&et_id)
     .execute(&state.pool)
     .await;
@@ -7144,6 +7154,7 @@ async fn render_event_type_form_error(
         tmpl.render(context! {
             resources_all => resources_all,
             can_manage_resources => auth_user.user.role == "admin",
+            can_enable_sms => can_enable_sms(&state.pool, &auth_user.user).await,
             selected_resource_ids => form.resource_ids.clone().unwrap_or_default(),
             resource_scheduling_mode => form.resource_scheduling_mode.as_deref().unwrap_or("all"),
             editing => editing,
@@ -7156,7 +7167,7 @@ async fn render_event_type_form_error(
             form_buffer_after => parse_int_field(&form.buffer_after, 0),
             form_min_notice => parse_int_field(&form.min_notice_min, 60),
             form_requires_confirmation => form.requires_confirmation.as_deref() == Some("on"),
-            form_sms_notifications_enabled => form.sms_notifications_enabled.as_deref() == Some("on"),
+            form_sms_phone_mode => crate::sms::phone_mode::parse(form.sms_phone_mode.as_deref().unwrap_or("")),
             form_visibility => form.visibility.as_deref().unwrap_or("public"),
             form_location_type => form.location_type.as_deref().unwrap_or("link"),
             form_location_value => form.location_value.as_deref().unwrap_or(""),
@@ -8143,6 +8154,7 @@ async fn new_group_event_type_form(
             teams => groups_ctx,
             resources_all => resources_all,
             can_manage_resources => auth_user.user.role == "admin",
+            can_enable_sms => can_enable_sms(&state.pool, &auth_user.user).await,
             selected_resource_ids => selected_resource_ids,
             resource_scheduling_mode => resource_scheduling_mode,
             form_team_id => groups.first().map(|(id, _)| id.as_str()).unwrap_or(""),
@@ -8252,7 +8264,8 @@ async fn create_group_event_type(
 
     let et_id = uuid::Uuid::new_v4().to_string();
     let requires_confirmation = form.requires_confirmation.as_deref() == Some("on");
-    let sms_notifications_enabled = form.sms_notifications_enabled.as_deref() == Some("on");
+    let sms_phone_mode =
+        resolve_phone_mode(&state.pool, user, form.sms_phone_mode.as_deref(), None).await;
     let location_type = form.location_type.as_deref().unwrap_or("link");
     let location_value = form
         .location_value
@@ -8297,7 +8310,7 @@ async fn create_group_event_type(
         .map(str::to_string);
 
     let _ = sqlx::query(
-        "INSERT INTO event_types (id, account_id, slug, title, description, duration_min, slot_interval_min, buffer_before, buffer_after, min_notice_min, requires_confirmation, location_type, location_value, team_id, created_by_user_id, default_calendar_view, first_slot_only, timezone, cancel_notice_min, reschedule_notice_min, meeting_pattern_override, sms_notifications_enabled)
+        "INSERT INTO event_types (id, account_id, slug, title, description, duration_min, slot_interval_min, buffer_before, buffer_after, min_notice_min, requires_confirmation, location_type, location_value, team_id, created_by_user_id, default_calendar_view, first_slot_only, timezone, cancel_notice_min, reschedule_notice_min, meeting_pattern_override, sms_phone_mode)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&et_id)
@@ -8321,7 +8334,7 @@ async fn create_group_event_type(
     .bind(cancel_notice_min)
     .bind(reschedule_notice_min)
     .bind(&meeting_pattern_override)
-    .bind(sms_notifications_enabled as i32)
+    .bind(&sms_phone_mode)
     .execute(&state.pool)
     .await;
 
@@ -8685,6 +8698,7 @@ async fn edit_group_event_type_form(
             original_slug => et_slug,
             resources_all => resources_all,
             can_manage_resources => auth_user.user.role == "admin",
+            can_enable_sms => can_enable_sms(&state.pool, &auth_user.user).await,
             selected_resource_ids => selected_resource_ids,
             resource_scheduling_mode => resource_scheduling_mode,
             form_title => et_title,
@@ -8781,7 +8795,13 @@ async fn update_group_event_type(
 
     let new_slug = form.slug.trim().to_lowercase().replace(' ', "-");
     let requires_confirmation = form.requires_confirmation.as_deref() == Some("on");
-    let sms_notifications_enabled = form.sms_notifications_enabled.as_deref() == Some("on");
+    let sms_phone_mode = resolve_phone_mode(
+        &state.pool,
+        user,
+        form.sms_phone_mode.as_deref(),
+        Some(&et_id),
+    )
+    .await;
     let visibility = form.visibility.as_deref().unwrap_or("public").to_string();
 
     // Check slug uniqueness within the team if changed
@@ -8857,7 +8877,7 @@ async fn update_group_event_type(
         .map(str::to_string);
 
     let _ = sqlx::query(
-        "UPDATE event_types SET slug = ?, title = ?, description = ?, duration_min = ?, slot_interval_min = ?, buffer_before = ?, buffer_after = ?, min_notice_min = ?, requires_confirmation = ?, location_type = ?, location_value = ?, reminder_minutes = ?, visibility = ?, max_additional_guests = ?, scheduling_mode = ?, default_calendar_view = ?, first_slot_only = ?, timezone = ?, cancel_notice_min = ?, reschedule_notice_min = ?, meeting_pattern_override = ?, sms_notifications_enabled = ? WHERE id = ?",
+        "UPDATE event_types SET slug = ?, title = ?, description = ?, duration_min = ?, slot_interval_min = ?, buffer_before = ?, buffer_after = ?, min_notice_min = ?, requires_confirmation = ?, location_type = ?, location_value = ?, reminder_minutes = ?, visibility = ?, max_additional_guests = ?, scheduling_mode = ?, default_calendar_view = ?, first_slot_only = ?, timezone = ?, cancel_notice_min = ?, reschedule_notice_min = ?, meeting_pattern_override = ?, sms_phone_mode = ? WHERE id = ?",
     )
     .bind(&new_slug)
     .bind(form.title.trim())
@@ -8880,7 +8900,7 @@ async fn update_group_event_type(
     .bind(cancel_notice_min)
     .bind(reschedule_notice_min)
     .bind(&meeting_pattern_override)
-    .bind(sms_notifications_enabled as i32)
+    .bind(&sms_phone_mode)
     .bind(&et_id)
     .execute(&state.pool)
     .await;
@@ -9630,8 +9650,8 @@ async fn show_group_book_form(
 ) -> Response {
     let embed = query.embed_params();
     let lang = crate::i18n::detect_from_headers(&headers);
-    let et: Option<(String, String, String, Option<String>, i32, String, Option<String>, String, String, i32, String, Option<String>, String, bool)> = sqlx::query_as(
-        "SELECT et.id, et.slug, et.title, et.description, et.duration_min, et.location_type, et.location_value, t.name, et.visibility, et.max_additional_guests, t.visibility, t.invite_token, t.id, et.sms_notifications_enabled
+    let et: Option<(String, String, String, Option<String>, i32, String, Option<String>, String, String, i32, String, Option<String>, String, String)> = sqlx::query_as(
+        "SELECT et.id, et.slug, et.title, et.description, et.duration_min, et.location_type, et.location_value, t.name, et.visibility, et.max_additional_guests, t.visibility, t.invite_token, t.id, et.sms_phone_mode
          FROM event_types et
          JOIN teams t ON t.id = et.team_id
          WHERE t.slug = ? AND et.slug = ? AND et.enabled = 1",
@@ -9656,7 +9676,7 @@ async fn show_group_book_form(
         team_visibility,
         team_invite_token,
         team_id,
-        sms_notifications_enabled,
+        sms_phone_mode,
     ) = match et {
         Some(e) => e,
         None => return Html("Event type not found.".to_string()).into_response(),
@@ -9766,7 +9786,7 @@ async fn show_group_book_form(
             form_email => invite_guest_email.as_deref().unwrap_or(""),
             form_notes => "",
             invite_token => query.invite.as_deref().unwrap_or(""),
-            sms_notifications_enabled => sms_notifications_enabled,
+            sms_phone_mode => sms_phone_mode,
             phone_default_country => phone_default_country,
             form_phone => "",
             max_additional_guests => max_additional_guests,
@@ -9858,13 +9878,13 @@ async fn handle_group_booking(
         None => return Html("Event type not found.".to_string()).into_response(),
     };
     let needs_approval = requires_confirmation != 0;
-    let sms_notifications_enabled: i32 =
-        sqlx::query_scalar("SELECT sms_notifications_enabled FROM event_types WHERE id = ?")
+    let sms_phone_mode: String =
+        sqlx::query_scalar("SELECT sms_phone_mode FROM event_types WHERE id = ?")
             .bind(&et_id)
             .fetch_optional(&state.pool)
             .await
             .unwrap_or(None)
-            .unwrap_or(0);
+            .unwrap_or_else(|| crate::sms::phone_mode::OFF.to_string());
     let scheduling_mode: String =
         sqlx::query_scalar("SELECT scheduling_mode FROM event_types WHERE id = ?")
             .bind(&et_id)
@@ -10113,28 +10133,16 @@ async fn handle_group_booking(
     };
 
     let sms_default_country: String = crate::sms::default_country_code(&state.pool).await;
-    let phone_to_store: Option<String> = if sms_notifications_enabled != 0 {
-        match form
-            .phone
-            .as_deref()
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-        {
-            Some(raw) => match crate::sms::phone::normalize(raw, &sms_default_country) {
-                Some(phone) => Some(phone),
-                None => {
-                    return render_booking_action_error(
-                        &state,
-                        &headers,
-                        &crate::i18n::translate(lang, "book-phone-invalid-title", None),
-                        &crate::i18n::translate(lang, "book-phone-invalid", None),
-                    );
-                }
-            },
-            None => None,
+    let phone_to_store = match resolve_guest_phone(
+        &sms_phone_mode,
+        form.phone.as_deref(),
+        &sms_default_country,
+        lang,
+    ) {
+        Ok(value) => value,
+        Err((title, message)) => {
+            return render_booking_action_error(&state, &headers, &title, &message);
         }
-    } else {
-        None
     };
 
     let insert_result = sqlx::query(
@@ -10349,7 +10357,7 @@ async fn handle_group_booking(
     // Pending bookings are notified when they are approved.
     notify_new_booking_sms(
         &state,
-        sms_notifications_enabled != 0,
+        crate::sms::collects_phone(&sms_phone_mode),
         phone_to_store.as_deref(),
         needs_approval,
         &et_title,
@@ -10379,6 +10387,7 @@ async fn handle_group_booking(
             location_type => loc_type,
             location_value => location_display,
             additional_attendees => additional_attendees,
+            ics_url => format!("/booking/ics/{}", cancel_token),
             cancel_notice_min => cancel_notice_min,
             reschedule_notice_min => reschedule_notice_min,
             company_link => state.company_link.read().await.clone(),
@@ -10708,8 +10717,8 @@ async fn show_dynamic_group_book_form(
     };
 
     let owner_username = &usernames[0];
-    let et: Option<(String, String, String, Option<String>, i32, String, Option<String>, String, i32, bool)> = sqlx::query_as(
-        "SELECT et.id, et.slug, et.title, et.description, et.duration_min, et.location_type, et.location_value, et.visibility, et.max_additional_guests, et.sms_notifications_enabled
+    let et: Option<(String, String, String, Option<String>, i32, String, Option<String>, String, i32, String)> = sqlx::query_as(
+        "SELECT et.id, et.slug, et.title, et.description, et.duration_min, et.location_type, et.location_value, et.visibility, et.max_additional_guests, et.sms_phone_mode
          FROM event_types et
          JOIN accounts a ON a.id = et.account_id
          JOIN users u ON u.id = a.user_id
@@ -10731,7 +10740,7 @@ async fn show_dynamic_group_book_form(
         loc_value,
         visibility,
         max_additional_guests,
-        sms_notifications_enabled,
+        sms_phone_mode,
     ) = match et {
         Some(e) => e,
         None => return Html("Event type not found.".to_string()),
@@ -10785,7 +10794,7 @@ async fn show_dynamic_group_book_form(
             },
             host_name => host_name,
             username => combined_username,
-            sms_notifications_enabled => sms_notifications_enabled,
+            sms_phone_mode => sms_phone_mode,
             phone_default_country => phone_default_country,
             form_phone => "",
             date => query.date,
@@ -10839,8 +10848,8 @@ async fn handle_dynamic_group_booking(
     };
 
     let owner_username = &usernames[0];
-    let et: Option<(String, String, String, i32, i32, i32, i32, i32, String, Option<String>, String, Option<i32>, String, i32, i32)> = sqlx::query_as(
-        "SELECT et.id, et.slug, et.title, et.duration_min, et.buffer_before, et.buffer_after, et.min_notice_min, et.requires_confirmation, et.location_type, et.location_value, u.id, et.reminder_minutes, et.visibility, et.max_additional_guests, et.sms_notifications_enabled
+    let et: Option<(String, String, String, i32, i32, i32, i32, i32, String, Option<String>, String, Option<i32>, String, i32, String)> = sqlx::query_as(
+        "SELECT et.id, et.slug, et.title, et.duration_min, et.buffer_before, et.buffer_after, et.min_notice_min, et.requires_confirmation, et.location_type, et.location_value, u.id, et.reminder_minutes, et.visibility, et.max_additional_guests, et.sms_phone_mode
          FROM event_types et
          JOIN accounts a ON a.id = et.account_id
          JOIN users u ON u.id = a.user_id
@@ -10867,7 +10876,7 @@ async fn handle_dynamic_group_booking(
         reminder_min,
         visibility,
         max_additional_guests,
-        sms_notifications_enabled,
+        sms_phone_mode,
     ) = match et {
         Some(e) => e,
         None => return Html("Event type not found.".to_string()).into_response(),
@@ -11012,28 +11021,16 @@ async fn handle_dynamic_group_booking(
     };
 
     let sms_default_country_dg: String = crate::sms::default_country_code(&state.pool).await;
-    let phone_to_store: Option<String> = if sms_notifications_enabled != 0 {
-        match form
-            .phone
-            .as_deref()
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-        {
-            Some(raw) => match crate::sms::phone::normalize(raw, &sms_default_country_dg) {
-                Some(phone) => Some(phone),
-                None => {
-                    return render_booking_action_error(
-                        state,
-                        headers,
-                        &crate::i18n::translate(lang, "book-phone-invalid-title", None),
-                        &crate::i18n::translate(lang, "book-phone-invalid", None),
-                    );
-                }
-            },
-            None => None,
+    let phone_to_store = match resolve_guest_phone(
+        &sms_phone_mode,
+        form.phone.as_deref(),
+        &sms_default_country_dg,
+        lang,
+    ) {
+        Ok(value) => value,
+        Err((title, message)) => {
+            return render_booking_action_error(state, headers, &title, &message);
         }
-    } else {
-        None
     };
 
     let insert_result = sqlx::query(
@@ -11236,6 +11233,7 @@ async fn handle_dynamic_group_booking(
             location_type => loc_type,
             location_value => location_display,
             additional_attendees => all_additional,
+            ics_url => format!("/booking/ics/{}", cancel_token),
             cancel_notice_min => cancel_notice_min,
             reschedule_notice_min => reschedule_notice_min,
             company_link => state.company_link.read().await.clone(),
@@ -11489,8 +11487,8 @@ async fn show_book_form_for_user(
             .into_response();
     }
 
-    let et: Option<(String, String, String, Option<String>, i32, String, Option<String>, String, i32, Option<String>, bool)> = sqlx::query_as(
-        "SELECT et.id, et.slug, et.title, et.description, et.duration_min, et.location_type, et.location_value, et.visibility, et.max_additional_guests, u.language, et.sms_notifications_enabled
+    let et: Option<(String, String, String, Option<String>, i32, String, Option<String>, String, i32, Option<String>, String)> = sqlx::query_as(
+        "SELECT et.id, et.slug, et.title, et.description, et.duration_min, et.location_type, et.location_value, et.visibility, et.max_additional_guests, u.language, et.sms_phone_mode
          FROM event_types et
          JOIN accounts a ON a.id = et.account_id
          JOIN users u ON u.id = a.user_id
@@ -11513,7 +11511,7 @@ async fn show_book_form_for_user(
         visibility,
         max_additional_guests,
         user_lang,
-        sms_notifications_enabled,
+        sms_phone_mode,
     ) = match et {
         Some(e) => e,
         None => return Html("Event type not found.".to_string()).into_response(),
@@ -11606,7 +11604,7 @@ async fn show_book_form_for_user(
             },
             host_name => host_name,
             username => username,
-            sms_notifications_enabled => sms_notifications_enabled,
+            sms_phone_mode => sms_phone_mode,
             phone_default_country => phone_default_country,
             form_phone => "",
             date => query.date,
@@ -11677,8 +11675,8 @@ async fn handle_booking_for_user(
         return render_booking_action_error(&state, &headers, "Invalid booking details", &e);
     }
 
-    let et: Option<(String, String, String, i32, i32, i32, i32, i32, String, Option<String>, String, Option<i32>, String, i32, Option<String>, bool)> = sqlx::query_as(
-        "SELECT et.id, et.slug, et.title, et.duration_min, et.buffer_before, et.buffer_after, et.min_notice_min, et.requires_confirmation, et.location_type, et.location_value, u.id, et.reminder_minutes, et.visibility, et.max_additional_guests, u.language, et.sms_notifications_enabled
+    let et: Option<(String, String, String, i32, i32, i32, i32, i32, String, Option<String>, String, Option<i32>, String, i32, Option<String>, String)> = sqlx::query_as(
+        "SELECT et.id, et.slug, et.title, et.duration_min, et.buffer_before, et.buffer_after, et.min_notice_min, et.requires_confirmation, et.location_type, et.location_value, u.id, et.reminder_minutes, et.visibility, et.max_additional_guests, u.language, et.sms_phone_mode
          FROM event_types et
          JOIN accounts a ON a.id = et.account_id
          JOIN users u ON u.id = a.user_id
@@ -11706,7 +11704,7 @@ async fn handle_booking_for_user(
         visibility,
         max_additional_guests,
         user_lang,
-        sms_notifications_enabled,
+        sms_phone_mode,
     ) = match et {
         Some(e) => e,
         None => return Html("Event type not found.".to_string()).into_response(),
@@ -11715,28 +11713,16 @@ async fn handle_booking_for_user(
     let lang = crate::i18n::resolve(user_lang.as_deref(), &headers);
     let needs_approval = requires_confirmation != 0;
     let sms_default_country: String = crate::sms::default_country_code(&state.pool).await;
-    let phone_to_store: Option<String> = if sms_notifications_enabled {
-        match form
-            .phone
-            .as_deref()
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-        {
-            Some(raw) => match crate::sms::phone::normalize(raw, &sms_default_country) {
-                Some(phone) => Some(phone),
-                None => {
-                    return render_booking_action_error(
-                        &state,
-                        &headers,
-                        &crate::i18n::translate(lang, "book-phone-invalid-title", None),
-                        &crate::i18n::translate(lang, "book-phone-invalid", None),
-                    );
-                }
-            },
-            None => None,
+    let phone_to_store = match resolve_guest_phone(
+        &sms_phone_mode,
+        form.phone.as_deref(),
+        &sms_default_country,
+        lang,
+    ) {
+        Ok(value) => value,
+        Err((title, message)) => {
+            return render_booking_action_error(&state, &headers, &title, &message);
         }
-    } else {
-        None
     };
 
     // Parse additional guests
@@ -12084,7 +12070,7 @@ async fn handle_booking_for_user(
     // Pending bookings are notified when they are approved.
     notify_new_booking_sms(
         &state,
-        sms_notifications_enabled,
+        crate::sms::collects_phone(&sms_phone_mode),
         phone_to_store.as_deref(),
         needs_approval,
         &et_title,
@@ -12123,6 +12109,7 @@ async fn handle_booking_for_user(
             location_type => loc_type,
             location_value => location_display,
             additional_attendees => additional_attendees,
+            ics_url => format!("/booking/ics/{}", cancel_token),
             cancel_notice_min => cancel_notice_min,
             reschedule_notice_min => reschedule_notice_min,
             company_link => state.company_link.read().await.clone(),
@@ -13836,7 +13823,7 @@ async fn show_book_form(
 ) -> impl IntoResponse {
     let lang = crate::i18n::detect_from_headers(&headers);
     let et: Option<(String, String, String, Option<String>, i32, i32, String, bool)> = sqlx::query_as(
-        "SELECT id, slug, title, description, duration_min, max_additional_guests, visibility, sms_notifications_enabled
+        "SELECT id, slug, title, description, duration_min, max_additional_guests, visibility, sms_phone_mode
          FROM event_types WHERE slug = ? AND enabled = 1",
     )
     .bind(&slug)
@@ -13852,7 +13839,7 @@ async fn show_book_form(
         duration,
         max_additional_guests,
         visibility,
-        sms_notifications_enabled,
+        sms_phone_mode,
     ) = match et {
         Some(e) => e,
         None => return Html("Event type not found.".to_string()),
@@ -13917,7 +13904,7 @@ async fn show_book_form(
             form_email => "",
             form_notes => "",
             form_phone => "",
-            sms_notifications_enabled => sms_notifications_enabled,
+            sms_phone_mode => sms_phone_mode,
             phone_default_country => phone_default_country,
             max_additional_guests => max_additional_guests,
             company_link => state.company_link.read().await.clone(),
@@ -14026,9 +14013,88 @@ struct BookForm {
     captcha_token: Option<String>,
     /// Optional guest phone number (E.164, e.g. `+15551234567`). Only shown
     /// on the booking page / used for SMS when the event type has
-    /// `sms_notifications_enabled` set; ignored otherwise even if posted.
+    /// `sms_phone_mode` set; ignored otherwise even if posted.
     #[serde(default)]
     phone: Option<String>,
+}
+
+/// Whether `user` may put an event type into an SMS-sending mode.
+///
+/// SMS spends instance-wide credit an admin paid for and the recipient is
+/// guest-controlled, so the default matches shared resources: admins only,
+/// with an explicit opt-out for instances where everyone is trusted.
+async fn can_enable_sms(pool: &SqlitePool, user: &crate::models::User) -> bool {
+    if user.role == "admin" {
+        return true;
+    }
+    sqlx::query_scalar::<_, bool>(
+        "SELECT sms_allow_all_users FROM auth_config WHERE id = 'singleton'",
+    )
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None)
+    .unwrap_or(false)
+}
+
+/// The phone mode to store for an event type, given what the form posted.
+///
+/// A user who may not enable SMS never has their post honoured: on create the
+/// event type stays `off`, and on edit the stored value is carried forward, so
+/// a member editing an admin's event type cannot silently turn SMS off either.
+async fn resolve_phone_mode(
+    pool: &SqlitePool,
+    user: &crate::models::User,
+    posted: Option<&str>,
+    event_type_id: Option<&str>,
+) -> String {
+    if can_enable_sms(pool, user).await {
+        return crate::sms::phone_mode::parse(posted.unwrap_or("")).to_string();
+    }
+
+    match event_type_id {
+        Some(id) => {
+            sqlx::query_scalar::<_, String>("SELECT sms_phone_mode FROM event_types WHERE id = ?")
+                .bind(id)
+                .fetch_optional(pool)
+                .await
+                .unwrap_or(None)
+                .unwrap_or_else(|| crate::sms::phone_mode::OFF.to_string())
+        }
+        None => crate::sms::phone_mode::OFF.to_string(),
+    }
+}
+
+/// Resolve the guest's phone number for storage, honouring the event type's
+/// phone mode. `Err` carries the localised (title, message) pair to render.
+///
+/// The booking form validates the same rules client-side with
+/// `setCustomValidity`, so a guest with JavaScript on gets an inline field
+/// error instead of ever reaching this. This is the backstop.
+fn resolve_guest_phone(
+    mode: &str,
+    raw: Option<&str>,
+    default_country: &str,
+    lang: &str,
+) -> Result<Option<String>, (String, String)> {
+    if !crate::sms::collects_phone(mode) {
+        return Ok(None);
+    }
+
+    let invalid = |key: &str| {
+        (
+            crate::i18n::translate(lang, "book-phone-invalid-title", None),
+            crate::i18n::translate(lang, key, None),
+        )
+    };
+
+    match raw.map(str::trim).filter(|p| !p.is_empty()) {
+        None if crate::sms::requires_phone(mode) => Err(invalid("book-phone-required")),
+        None => Ok(None),
+        Some(value) => match crate::sms::phone::normalize(value, default_country) {
+            Some(e164) => Ok(Some(e164)),
+            None => Err(invalid("book-phone-invalid")),
+        },
+    }
 }
 
 /// Confirmation SMS for a freshly submitted booking.
@@ -14121,9 +14187,9 @@ async fn handle_booking(
         Option<i32>,
         i32,
         String,
-        bool,
+        String,
     )> = sqlx::query_as(
-        "SELECT id, slug, title, duration_min, buffer_before, buffer_after, min_notice_min, requires_confirmation, reminder_minutes, max_additional_guests, visibility, sms_notifications_enabled
+        "SELECT id, slug, title, duration_min, buffer_before, buffer_after, min_notice_min, requires_confirmation, reminder_minutes, max_additional_guests, visibility, sms_phone_mode
          FROM event_types WHERE slug = ? AND enabled = 1",
     )
     .bind(&slug)
@@ -14143,7 +14209,7 @@ async fn handle_booking(
         reminder_min,
         max_additional_guests,
         visibility,
-        sms_notifications_enabled,
+        sms_phone_mode,
     ) = match et {
         Some(e) => e,
         None => return Html("Event type not found.".to_string()).into_response(),
@@ -14156,28 +14222,16 @@ async fn handle_booking(
     // type can never leak a phone number nobody asked to collect.
     let sms_default_country: String = crate::sms::default_country_code(&state.pool).await;
 
-    let phone_to_store: Option<String> = if sms_notifications_enabled {
-        match form
-            .phone
-            .as_deref()
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-        {
-            Some(raw) => match crate::sms::phone::normalize(raw, &sms_default_country) {
-                Some(phone) => Some(phone),
-                None => {
-                    return render_booking_action_error(
-                        &state,
-                        &headers,
-                        &crate::i18n::translate(lang, "book-phone-invalid-title", None),
-                        &crate::i18n::translate(lang, "book-phone-invalid", None),
-                    );
-                }
-            },
-            None => None,
+    let phone_to_store = match resolve_guest_phone(
+        &sms_phone_mode,
+        form.phone.as_deref(),
+        &sms_default_country,
+        lang,
+    ) {
+        Ok(value) => value,
+        Err((title, message)) => {
+            return render_booking_action_error(&state, &headers, &title, &message);
         }
-    } else {
-        None
     };
 
     // Block non-public event types on legacy route
@@ -14500,7 +14554,7 @@ async fn handle_booking(
     // Pending bookings are notified when they are approved.
     notify_new_booking_sms(
         &state,
-        sms_notifications_enabled,
+        crate::sms::collects_phone(&sms_phone_mode),
         phone_to_store.as_deref(),
         needs_approval,
         &et_title,
@@ -14540,6 +14594,7 @@ async fn handle_booking(
             notes => form.notes,
             pending => needs_approval,
             additional_attendees => additional_attendees,
+            ics_url => format!("/booking/ics/{}", cancel_token),
             cancel_notice_min => cancel_notice_min,
             reschedule_notice_min => reschedule_notice_min,
             company_link => state.company_link.read().await.clone(),
@@ -15493,6 +15548,7 @@ async fn admin_dashboard(
         sms_sender,
         sms_base_url,
         sms_default_country,
+        sms_daily_cap,
         sms_enabled,
         sms_from_env,
         sms_error,
@@ -15504,6 +15560,7 @@ async fn admin_dashboard(
             status.sender,
             status.base_url,
             status.default_country_code,
+            status.daily_cap,
             status.enabled,
             status.from_env,
             String::new(),
@@ -15515,6 +15572,7 @@ async fn admin_dashboard(
             String::new(),
             String::new(),
             crate::sms::phone::DEFAULT_COUNTRY_CODE.to_string(),
+            0,
             false,
             false,
             String::new(),
@@ -15526,11 +15584,21 @@ async fn admin_dashboard(
             String::new(),
             String::new(),
             crate::sms::phone::DEFAULT_COUNTRY_CODE.to_string(),
+            0,
             false,
             false,
             e.to_string(),
         ),
     };
+
+    let (sms_cost_today, sms_cost_currency) = crate::sms::cost_today(&state.pool).await;
+    let sms_sent_today = crate::sms::sent_today(&state.pool).await;
+    let sms_allow_all_users: bool =
+        sqlx::query_scalar("SELECT sms_allow_all_users FROM auth_config WHERE id = 'singleton'")
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap_or(None)
+            .unwrap_or(false);
 
     // Flash banner after a test round-trip (?sms_test=sent|checked|error).
     let sms_test_result = query.get("sms_test").cloned().unwrap_or_default();
@@ -15647,6 +15715,11 @@ async fn admin_dashboard(
             sms_sender => sms_sender,
             sms_base_url => sms_base_url,
             sms_default_country => sms_default_country,
+            sms_daily_cap => sms_daily_cap,
+            sms_sent_today => sms_sent_today,
+            sms_cost_today => format!("{:.2}", sms_cost_today),
+            sms_cost_currency => sms_cost_currency,
+            sms_allow_all_users => sms_allow_all_users,
             sms_enabled => sms_enabled,
             sms_from_env => sms_from_env,
             sms_error => sms_error,
@@ -17031,6 +17104,8 @@ struct AdminSmsForm {
     base_url: Option<String>,
     /// Default country calling code used to normalise guest-entered local numbers.
     default_country_code: Option<String>,
+    /// Instance-wide messages/day ceiling; empty or 0 means no limit.
+    daily_cap: Option<String>,
     /// HTML checkbox: present (any value) when checked, absent when unchecked.
     enabled: Option<String>,
 }
@@ -17066,6 +17141,14 @@ async fn admin_update_sms(
         .trim()
         .to_string();
     let enabled = form.enabled.is_some();
+    let daily_cap: i64 = form
+        .daily_cap
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+        .max(0);
 
     let api_secret = form.api_secret.unwrap_or_default();
     let secret_provided = !api_secret.trim().is_empty();
@@ -17119,6 +17202,7 @@ async fn admin_update_sms(
         sender: sender.clone(),
         base_url: base_url.clone(),
         default_country_code: default_country_code.clone(),
+        daily_cap,
     };
     if let Err(e) = crate::sms::factory::validate_config(&candidate) {
         return redirect_err(&format!("SMS settings: {}.", e));
@@ -17147,7 +17231,7 @@ async fn admin_update_sms(
                 None
             };
             sqlx::query(
-                "UPDATE sms_config SET provider = ?, api_key = ?, api_secret_enc = ?, sender = ?, base_url = ?, default_country_code = ?, enabled = ? WHERE id = ?",
+                "UPDATE sms_config SET provider = ?, api_key = ?, api_secret_enc = ?, sender = ?, base_url = ?, default_country_code = ?, daily_cap = ?, enabled = ? WHERE id = ?",
             )
             .bind(&provider)
             .bind(&api_key)
@@ -17155,6 +17239,7 @@ async fn admin_update_sms(
             .bind(&sender)
             .bind(&base_url)
             .bind(&default_country_code)
+            .bind(daily_cap)
             .bind(enabled)
             .bind(&id)
             .execute(&state.pool)
@@ -17165,13 +17250,14 @@ async fn admin_update_sms(
             // the gateway is unchanged (or is the credential-less webhook),
             // so the stored secret still belongs to this gateway.
             sqlx::query(
-                "UPDATE sms_config SET provider = ?, api_key = ?, sender = ?, base_url = ?, default_country_code = ?, enabled = ? WHERE id = ?",
+                "UPDATE sms_config SET provider = ?, api_key = ?, sender = ?, base_url = ?, default_country_code = ?, daily_cap = ?, enabled = ? WHERE id = ?",
             )
             .bind(&provider)
             .bind(&api_key)
             .bind(&sender)
             .bind(&base_url)
             .bind(&default_country_code)
+            .bind(daily_cap)
             .bind(enabled)
             .bind(&id)
             .execute(&state.pool)
@@ -17187,7 +17273,7 @@ async fn admin_update_sms(
                 None
             };
             sqlx::query(
-                "INSERT INTO sms_config (id, provider, api_key, api_secret_enc, sender, base_url, default_country_code, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO sms_config (id, provider, api_key, api_secret_enc, sender, base_url, default_country_code, daily_cap, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(uuid::Uuid::new_v4().to_string())
             .bind(&provider)
@@ -17196,6 +17282,7 @@ async fn admin_update_sms(
             .bind(&sender)
             .bind(&base_url)
             .bind(&default_country_code)
+            .bind(daily_cap)
             .bind(enabled)
             .execute(&state.pool)
             .await
@@ -17280,6 +17367,43 @@ async fn admin_update_sms_test(
             redirect("error", &e.to_string())
         }
     }
+}
+
+#[derive(Deserialize)]
+struct AdminSmsPolicyForm {
+    _csrf: Option<String>,
+    /// HTML checkbox: present when any user may put an event type into an
+    /// SMS-sending mode, absent for admins only.
+    allow_all_users: Option<String>,
+}
+
+/// Who may enable SMS on an event type.
+///
+/// Separate from the gateway settings on purpose: it is an instance policy,
+/// not a credential, so it stays editable even when the `CALRS_SMS_*` block
+/// governs the gateway itself.
+async fn admin_update_sms_policy(
+    State(state): State<Arc<AppState>>,
+    _admin: crate::auth::AdminUser,
+    headers: HeaderMap,
+    Form(form): Form<AdminSmsPolicyForm>,
+) -> impl IntoResponse {
+    if let Err(resp) = verify_csrf_token(&headers, &form._csrf) {
+        return resp;
+    }
+
+    let allow_all = form.allow_all_users.is_some();
+    if let Err(e) =
+        sqlx::query("UPDATE auth_config SET sms_allow_all_users = ? WHERE id = 'singleton'")
+            .bind(allow_all)
+            .execute(&state.pool)
+            .await
+    {
+        return internal_error_response("save sms policy", &e);
+    }
+
+    tracing::info!(admin = %_admin.0.email, allow_all, "admin: sms event-type policy updated");
+    Redirect::to("/dashboard/admin").into_response()
 }
 
 #[derive(Deserialize)]
@@ -17784,9 +17908,9 @@ async fn approve_booking_by_token(
     let lang = crate::i18n::detect_from_headers(&headers);
     // Look up booking by confirm_token
     #[allow(clippy::type_complexity)]
-    let booking: Option<(String, String, String, String, String, String, String, String, String, Option<String>, Option<String>, String, Option<String>, String, Option<String>, bool)> =
+    let booking: Option<(String, String, String, String, String, String, String, String, String, Option<String>, Option<String>, String, Option<String>, String, Option<String>, String)> =
         sqlx::query_as(
-            "SELECT b.id, b.uid, b.guest_name, b.guest_email, b.start_at, b.end_at, et.title, a.user_id, u.name, et.location_value, b.cancel_token, COALESCE(b.guest_timezone, 'UTC'), b.reschedule_token, b.event_type_id, b.guest_phone, et.sms_notifications_enabled
+            "SELECT b.id, b.uid, b.guest_name, b.guest_email, b.start_at, b.end_at, et.title, a.user_id, u.name, et.location_value, b.cancel_token, COALESCE(b.guest_timezone, 'UTC'), b.reschedule_token, b.event_type_id, b.guest_phone, et.sms_phone_mode
              FROM bookings b
              JOIN event_types et ON et.id = b.event_type_id
              JOIN accounts a ON a.id = et.account_id
@@ -17814,7 +17938,7 @@ async fn approve_booking_by_token(
         reschedule_token,
         event_type_id,
         guest_phone,
-        sms_notifications_enabled,
+        sms_phone_mode,
     ) = match booking {
         Some(b) => b,
         None => {
@@ -18023,7 +18147,7 @@ async fn approve_booking_by_token(
     if let Some(ctx) = crate::sms::SmsContext::for_booking(
         &details,
         guest_phone.as_deref(),
-        sms_notifications_enabled,
+        crate::sms::collects_phone(&sms_phone_mode),
     ) {
         crate::sms::notify_guest(
             &state.pool,
@@ -18333,6 +18457,108 @@ fn check_notice_window(
     Some(Html(rendered).into_response())
 }
 
+/// Serve the booking as an iCalendar file, addressed by the guest's own cancel
+/// token.
+///
+/// The confirmation email already attaches one, but the guest is looking at the
+/// confirmation *page* at the moment they want to add it, and an instance with
+/// no SMTP configured never sends that email at all.
+async fn booking_ics(
+    State(state): State<Arc<AppState>>,
+    Path(token): Path<String>,
+) -> axum::response::Response {
+    #[allow(clippy::type_complexity)]
+    let booking: Option<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT b.uid, b.guest_name, b.guest_email, COALESCE(b.guest_timezone, 'UTC'), \
+                b.start_at, b.end_at, et.title, u.name, COALESCE(u.booking_email, u.email), \
+                COALESCE(NULLIF(b.meeting_url, ''), et.location_value), et.id, b.notes
+             FROM bookings b
+             JOIN event_types et ON et.id = b.event_type_id
+             JOIN accounts a ON a.id = et.account_id
+             JOIN users u ON u.id = COALESCE(b.assigned_user_id, a.user_id)
+             WHERE b.cancel_token = ? AND b.status IN ('confirmed', 'pending')",
+    )
+    .bind(&token)
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or(None);
+
+    let Some((
+        uid,
+        guest_name,
+        guest_email,
+        guest_timezone,
+        start_at,
+        end_at,
+        event_title,
+        host_name,
+        host_email,
+        location,
+        et_id,
+        notes,
+    )) = booking
+    else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            "This booking is no longer available.",
+        )
+            .into_response();
+    };
+
+    // start_at/end_at are stored in the event type's tz; the ICS carries
+    // guest-local wall-clock like every other consumer. See #101.
+    let stored_tz = get_host_tz(&state.pool, &et_id).await;
+    let guest_tz_parsed = guest_timezone.parse::<Tz>().unwrap_or(Tz::UTC);
+    let (date, start_time, end_time) =
+        booking_strings_in_guest_tz(&start_at, &end_at, stored_tz, guest_tz_parsed);
+
+    let details = crate::email::BookingDetails {
+        event_title,
+        date,
+        start_time,
+        end_time,
+        guest_name,
+        guest_email,
+        guest_timezone,
+        host_name,
+        host_email,
+        uid: uid.clone(),
+        notes,
+        location: location.filter(|l| !l.is_empty()),
+        host_timezone: stored_tz.name().to_string(),
+        ..Default::default()
+    };
+
+    let ics = crate::email::generate_ics(&details, "PUBLISH");
+    (
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/calendar; charset=UTF-8".to_string(),
+            ),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                "attachment; filename=\"booking.ics\"".to_string(),
+            ),
+        ],
+        ics,
+    )
+        .into_response()
+}
+
 async fn guest_cancel_form(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -18443,9 +18669,9 @@ async fn guest_cancel_booking(
     }
     let lang = crate::i18n::detect_from_headers(&headers);
     #[allow(clippy::type_complexity)]
-    let booking: Option<(String, String, String, String, String, String, String, String, String, String, String, Option<String>, bool)> =
+    let booking: Option<(String, String, String, String, String, String, String, String, String, String, String, Option<String>, String)> =
         sqlx::query_as(
-            "SELECT b.id, b.uid, b.guest_name, b.guest_email, b.start_at, b.end_at, et.title, u.name, COALESCE(u.booking_email, u.email), COALESCE(b.guest_timezone, 'UTC'), et.id, b.guest_phone, et.sms_notifications_enabled
+            "SELECT b.id, b.uid, b.guest_name, b.guest_email, b.start_at, b.end_at, et.title, u.name, COALESCE(u.booking_email, u.email), COALESCE(b.guest_timezone, 'UTC'), et.id, b.guest_phone, et.sms_phone_mode
              FROM bookings b
              JOIN event_types et ON et.id = b.event_type_id
              JOIN accounts a ON a.id = et.account_id
@@ -18470,7 +18696,7 @@ async fn guest_cancel_booking(
         guest_timezone,
         et_id,
         guest_phone,
-        sms_notifications_enabled,
+        sms_phone_mode,
     ) = match booking {
         Some(b) => b,
         None => {
@@ -18573,7 +18799,7 @@ async fn guest_cancel_booking(
     if let Some(ctx) = crate::sms::SmsContext::for_cancellation(
         &details,
         guest_phone.as_deref(),
-        sms_notifications_enabled,
+        crate::sms::collects_phone(&sms_phone_mode),
     ) {
         crate::sms::notify_guest(
             &state.pool,
@@ -19395,8 +19621,8 @@ async fn guest_reschedule_booking(
     // Reschedule SMS to the guest. A reschedule that needs approval stays
     // silent here, like its email: the guest is told when the host approves.
     if !needs_approval {
-        let sms_target: Option<(Option<String>, bool)> = sqlx::query_as(
-            "SELECT b.guest_phone, et.sms_notifications_enabled FROM bookings b
+        let sms_target: Option<(Option<String>, String)> = sqlx::query_as(
+            "SELECT b.guest_phone, et.sms_phone_mode FROM bookings b
              JOIN event_types et ON et.id = b.event_type_id WHERE b.id = ?",
         )
         .bind(&booking_id)
@@ -19404,11 +19630,11 @@ async fn guest_reschedule_booking(
         .await
         .unwrap_or(None);
 
-        if let Some((phone, sms_enabled)) = sms_target {
+        if let Some((phone, phone_mode)) = sms_target {
             if let Some(phone) = phone
                 .as_deref()
                 .map(str::trim)
-                .filter(|p| sms_enabled && !p.is_empty())
+                .filter(|p| crate::sms::collects_phone(&phone_mode) && !p.is_empty())
             {
                 crate::sms::notify_guest(
                     &state.pool,
@@ -19446,6 +19672,7 @@ async fn guest_reschedule_booking(
             guest_email => guest_email,
             pending => needs_approval,
             rescheduled => true,
+            ics_url => format!("/booking/ics/{}", new_cancel_token),
             cancel_notice_min => cancel_notice_min,
             reschedule_notice_min => reschedule_notice_min,
             company_link => state.company_link.read().await.clone(),
@@ -29930,7 +30157,7 @@ mod tests {
             "phone field should be absent by default"
         );
 
-        sqlx::query("UPDATE event_types SET sms_notifications_enabled = 1 WHERE id = ?")
+        sqlx::query("UPDATE event_types SET sms_phone_mode = 'optional' WHERE id = ?")
             .bind(&et_id)
             .execute(&pool)
             .await
@@ -29945,6 +30172,261 @@ mod tests {
         );
         // The country code shown in the hint comes from the SMS config.
         assert!(body.contains(crate::sms::phone::DEFAULT_COUNTRY_CODE));
+    }
+
+    // --- Phone modes: off, optional, required ---
+
+    #[tokio::test]
+    async fn required_phone_mode_blocks_a_booking_with_no_number() {
+        let (app, pool, _, et_id) = setup_test_app().await;
+        sqlx::query("UPDATE event_types SET sms_phone_mode = 'required' WHERE id = ?")
+            .bind(&et_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let date = (chrono::Utc::now() + chrono::Duration::days(3))
+            .format("%Y-%m-%d")
+            .to_string();
+
+        // The form marks the field required, and the server refuses too.
+        let response = app
+            .clone()
+            .oneshot(get(&format!(
+                "/u/testuser/test-meeting/book?date={}&time=10:00&tz=UTC",
+                date
+            )))
+            .await
+            .unwrap();
+        let body = body_string(response).await;
+        assert!(body.contains("id=\"phone\""), "phone field should render");
+        assert!(body.contains("required"), "phone field should be required");
+
+        let csrf = "test-csrf-phone-required";
+        let form = format!(
+            "_csrf={}&date={}&time=10%3A00&name=No+Phone&email=nophone%40test.com&notes=&phone=",
+            csrf, date
+        );
+        let response = app
+            .clone()
+            .oneshot(post_form_unauthed(
+                "/u/testuser/test-meeting/book",
+                csrf,
+                &form,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body = body_string(response).await;
+        assert!(
+            body.contains("phone number"),
+            "expected the phone error: {}",
+            body
+        );
+
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM bookings WHERE guest_email = 'nophone@test.com'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count.0, 0, "the booking must not have been stored");
+    }
+
+    #[tokio::test]
+    async fn optional_phone_mode_stores_a_normalized_number_and_tolerates_an_empty_one() {
+        let (app, pool, _, et_id) = setup_test_app().await;
+        sqlx::query("UPDATE event_types SET sms_phone_mode = 'optional' WHERE id = ?")
+            .bind(&et_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO sms_config (id, provider, api_secret_enc, sender, default_country_code) \
+             VALUES ('cfg', 'sevenio', 'x', 'calrs', '+33')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let base = chrono::Utc::now() + chrono::Duration::days(3);
+        let csrf = "test-csrf-phone-optional";
+
+        // A national number is normalized to E.164 with the configured country.
+        let form = format!(
+            "_csrf={}&date={}&time=10%3A00&name=With+Phone&email=with%40test.com&notes=&phone=06+12+34+56+78",
+            csrf,
+            base.format("%Y-%m-%d")
+        );
+        let response = app
+            .clone()
+            .oneshot(post_form_unauthed(
+                "/u/testuser/test-meeting/book",
+                csrf,
+                &form,
+            ))
+            .await
+            .unwrap();
+        assert!(response.status() == 200 || response.status().is_redirection());
+        let stored: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT guest_phone FROM bookings WHERE guest_email = 'with@test.com'")
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            stored.and_then(|r| r.0).as_deref(),
+            Some("+33612345678"),
+            "national number should be stored as E.164"
+        );
+
+        // Leaving it empty is fine: the guest simply gets no SMS.
+        let form = format!(
+            "_csrf={}&date={}&time=11%3A00&name=No+Phone&email=without%40test.com&notes=&phone=",
+            csrf,
+            base.format("%Y-%m-%d")
+        );
+        let response = app
+            .oneshot(post_form_unauthed(
+                "/u/testuser/test-meeting/book",
+                csrf,
+                &form,
+            ))
+            .await
+            .unwrap();
+        assert!(response.status() == 200 || response.status().is_redirection());
+        let stored: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM bookings WHERE guest_email = 'without@test.com' AND guest_phone IS NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored.0, 1, "booking should be stored without a number");
+    }
+
+    // --- Only permitted users may put an event type into an SMS mode ---
+
+    #[tokio::test]
+    async fn non_admins_cannot_enable_sms_unless_the_policy_allows_it() {
+        let pool = setup_test_db().await;
+        let (_user_id, account_id, et_id) = seed_test_data(&pool).await;
+
+        // A plain member of the same instance.
+        let member_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO users (id, email, name, role, auth_provider, username, enabled) VALUES (?, 'member@example.com', 'Member', 'user', 'local', 'member', 1)")
+            .bind(&member_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let member: crate::models::User = sqlx::query_as("SELECT * FROM users WHERE id = ?")
+            .bind(&member_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let admin: crate::models::User =
+            sqlx::query_as("SELECT * FROM users WHERE role = 'admin' LIMIT 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let _ = account_id;
+
+        // Default policy: admins only.
+        assert!(can_enable_sms(&pool, &admin).await);
+        assert!(!can_enable_sms(&pool, &member).await);
+
+        // A member's post is ignored on create, and carried forward on edit.
+        assert_eq!(
+            resolve_phone_mode(&pool, &member, Some("required"), None).await,
+            "off"
+        );
+        sqlx::query("UPDATE event_types SET sms_phone_mode = 'optional' WHERE id = ?")
+            .bind(&et_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            resolve_phone_mode(&pool, &member, Some("off"), Some(&et_id)).await,
+            "optional",
+            "a member must not be able to turn an admin's SMS setting off either"
+        );
+
+        // Opening the policy up lets members choose.
+        sqlx::query("UPDATE auth_config SET sms_allow_all_users = 1 WHERE id = 'singleton'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(can_enable_sms(&pool, &member).await);
+        assert_eq!(
+            resolve_phone_mode(&pool, &member, Some("required"), None).await,
+            "required"
+        );
+    }
+
+    // --- The daily cap stops sending without failing bookings ---
+
+    #[tokio::test]
+    async fn the_daily_cap_counts_todays_messages() {
+        let pool = setup_test_db().await;
+        assert_eq!(crate::sms::sent_today(&pool).await, 0);
+
+        for i in 0..3 {
+            sqlx::query(
+                "INSERT INTO sms_usage (id, event, provider, segments, cost, currency) \
+                 VALUES (?, 'confirmed', 'sevenio', 1, 0.075, 'EUR')",
+            )
+            .bind(format!("usage-{}", i))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        assert_eq!(crate::sms::sent_today(&pool).await, 3);
+
+        let (cost, currency) = crate::sms::cost_today(&pool).await;
+        assert!((cost - 0.225).abs() < 1e-9, "cost was {}", cost);
+        assert_eq!(currency, "EUR");
+
+        // Yesterday's traffic does not count against today's allowance.
+        sqlx::query(
+            "INSERT INTO sms_usage (id, sent_at, event, provider) \
+             VALUES ('old', datetime('now', '-2 days'), 'reminder', 'sevenio')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(crate::sms::sent_today(&pool).await, 3);
+    }
+
+    // --- Guests can add the booking to their calendar from the page ---
+
+    #[tokio::test]
+    async fn booking_ics_is_served_for_a_valid_cancel_token() {
+        let (app, pool, _, et_id) = setup_test_app().await;
+        let booking_id = uuid::Uuid::new_v4().to_string();
+        let cancel_tok = uuid::Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO bookings (id, event_type_id, uid, guest_name, guest_email, guest_timezone, start_at, end_at, status, cancel_token, reschedule_token) VALUES (?, ?, 'uid-ics', 'ICS Guest', 'ics@test.com', 'UTC', '2030-06-15T10:00:00', '2030-06-15T10:30:00', 'confirmed', ?, 'resched-ics')")
+            .bind(&booking_id)
+            .bind(&et_id)
+            .bind(&cancel_tok)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(get(&format!("/booking/ics/{}", cancel_tok)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .starts_with("text/calendar"));
+        let body = body_string(response).await;
+        assert!(body.contains("BEGIN:VCALENDAR"));
+        assert!(body.contains("UID:uid-ics"));
+
+        let response = app.oneshot(get("/booking/ics/not-a-token")).await.unwrap();
+        assert_eq!(response.status(), 404);
     }
 
     // --- Switching gateway must not reuse the previous gateway's credential ---
@@ -30088,7 +30570,7 @@ mod tests {
     async fn dashboard_bookings_shows_guest_phone_for_sms_booking() {
         let (app, pool, session, et_id) = setup_test_app().await;
 
-        sqlx::query("UPDATE event_types SET sms_notifications_enabled = 1 WHERE id = ?")
+        sqlx::query("UPDATE event_types SET sms_phone_mode = 'optional' WHERE id = ?")
             .bind(&et_id)
             .execute(&pool)
             .await

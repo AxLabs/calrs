@@ -56,12 +56,49 @@
       <input type="email" id="email" name="email" required maxlength="255" value="{{ form_email }}" placeholder="{{ t('book-email-placeholder') }}" pattern="[^@\s]+@[^@\s]+\.[^@\s]{2,}" title="{{ t('book-email-invalid') }}">
     </div>
 
-    {% if sms_notifications_enabled %}
+    {% if sms_phone_mode != "off" %}
+    {% set phone_required = sms_phone_mode == "required" %}
     <div class="form-group">
-      <label for="phone">{{ t("book-phone-label") }} <span style="color: var(--text-muted); font-weight: 400;">{{ t("book-phone-hint") }}</span></label>
-      <input type="tel" id="phone" name="phone" maxlength="20" value="{{ form_phone }}" placeholder="{{ t('book-phone-placeholder') }}" autocomplete="tel">
-      <div style="color: var(--text-muted); font-size: 0.8rem; margin-top: 0.25rem;">{{ t("book-phone-help", country=phone_default_country) }}</div>
+      <label for="phone">{{ t("book-phone-label") }} {% if not phone_required %}<span style="color: var(--text-muted); font-weight: 400;">{{ t("book-notes-optional") }}</span>{% endif %}</label>
+      <input type="tel" id="phone" name="phone" maxlength="20" inputmode="tel" autocomplete="tel" value="{{ form_phone }}" placeholder="{{ t('book-phone-placeholder') }}"{% if phone_required %} required{% endif %}>
+      <div style="color: var(--text-muted); font-size: 0.8rem; margin-top: 0.25rem;">
+        {{ t("book-phone-help", country=phone_default_country) }}
+        {% if not phone_required %}{{ t("book-phone-optional-consequence") }}{% endif %}
+      </div>
     </div>
+    <script>
+    (function() {
+      // Mirrors sms::phone::normalize server-side so a bad number is caught in
+      // the field, with the browser's own inline error, rather than costing the
+      // guest the whole form. The server still validates; this is UX.
+      var phone = document.getElementById('phone');
+      if (!phone) return;
+      var country = {{ phone_default_country | tojson }};
+      var msg = {{ t("book-phone-invalid") | tojson }};
+
+      function normalized(raw) {
+        var cleaned = raw.trim().replace(/[\s\-().\/ ]/g, '');
+        if (!cleaned) return '';
+        if (cleaned.indexOf('00') === 0) return '+' + cleaned.slice(2);
+        if (cleaned.charAt(0) === '+') return cleaned;
+        return country + cleaned.replace(/^0/, '');
+      }
+
+      function update() {
+        var value = phone.value.trim();
+        if (!value) {
+          phone.setCustomValidity('');
+          return;
+        }
+        var e164 = normalized(value);
+        phone.setCustomValidity(/^\+\d{8,15}$/.test(e164) ? '' : msg);
+      }
+
+      phone.addEventListener('input', update);
+      phone.addEventListener('blur', update);
+      update();
+    })();
+    </script>
     {% endif %}
     <script>
     (function() {

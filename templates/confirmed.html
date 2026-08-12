@@ -46,6 +46,11 @@
     <p class="muted" style="font-size: 0.875rem; color: var(--text-muted); margin-top: 0.25rem;">{{ t("confirmed-reschedule-notice-info", minutes=reschedule_notice_min) }}</p>
   {% endif %}
 </div>
+{% if ics_url is defined and ics_url and not pending %}
+<div style="text-align: center; margin-top: 1.25rem;">
+  <a href="{{ ics_url }}" download style="display: inline-block; padding: 0.625rem 1.125rem; border: 1px solid var(--border); border-radius: var(--radius); color: var(--text); text-decoration: none; font-size: 0.9rem; background: var(--surface);">{{ t("confirmed-add-to-calendar") }}</a>
+</div>
+{% endif %}
 <div style="text-align: center; margin-top: 1.5rem;">
   {% if team_slug %}<a href="/team/{{ team_slug }}/{{ event_type.slug }}{{ embed_qs_q | default('') }}" style="color: var(--accent); font-size: 0.9rem;">&larr; {{ t("confirmed-book-another") }}</a>
   {% elif username %}<a href="/u/{{ username }}/{{ event_type.slug }}{{ embed_qs_q | default('') }}" style="color: var(--accent); font-size: 0.9rem;">&larr; {{ t("confirmed-book-another") }}</a>{% endif %}

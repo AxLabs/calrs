@@ -98,7 +98,7 @@ calrs/
 │   ├── 057_runtime_settings.sql  ← base_url + allow_private_hosts on auth_config (env-overridable runtime settings)
 │   ├── 058_resources.sql         ← shared resources: resources, resource_events, event_type_resources; resource_scheduling_mode, assigned_resource_id, lend_resource_write
 │   ├── 059_resource_sync_error.sql ← last_sync_error on resources (feed failure indicator)
-│   └── 062_sms_notifications.sql ← SMS: guest_phone on bookings, sms_notifications_enabled on event_types, sms_config table
+│   └── 062_sms_notifications.sql ← SMS: guest_phone on bookings, sms_phone_mode on event_types, sms_config + sms_usage tables, sms_allow_all_users on auth_config
 ├── templates/
 │   ├── base.html                 ← base layout + CSS (light/dark mode)
 │   ├── dashboard_base.html       ← sidebar layout (extends base.html, all dashboard pages extend this)
@@ -460,7 +460,7 @@ Because `--surface`, `--border`, etc. are already overridden by `html.dark { ...
 
 ## SMS notifications
 
-**Concept:** optional text-message notifications to the guest, opt-in per event type. Off by default twice over: with no `sms_config` row *and* no event type setting `sms_notifications_enabled`, nothing in `src/sms/` ever runs and the booking flow is byte-for-byte what it was.
+**Concept:** optional text-message notifications to the guest, opt-in per event type. Off by default twice over: with no `sms_config` row *and* every event type leaving `sms_phone_mode` at `off`, nothing in `src/sms/` ever runs and the booking flow is byte-for-byte what it was.
 
 **Provider abstraction:** `SmsProvider` (in `src/sms/mod.rs`) is the same shape as `CalendarProvider` in `providers/`: an object-safe async trait with `send(to, body)` and an optional `check()`, plus a `factory.rs` that dispatches on `sms_config.provider`. Four adapters ship: `twilio`, `gatewayapi`, `sevenio`, and `webhook` (POSTs `{"to","text","sender"}` to any URL, optionally HMAC-signed like the meeting webhook, so a gateway with no adapter is a small script away).
 
@@ -475,6 +475,15 @@ Adapters own request building **and** response parsing, because "the credentials
 **Bodies** are composed in `message.rs` from the `sms-*` Fluent keys in the booking's own language, never in the provider. SMS is billed per 160-character GSM-7 segment, and one character outside GSM-7 (a Polish `ł`, a curly quote) drops that to 70, so keep those keys terse: `estimate_segments()` backs a test asserting every shipped body in every shipped language stays within two segments. Host-controlled event titles are shortened to 60 characters so the date and time always survive.
 
 **Phone numbers:** the guest types whatever they like (`06 12 34 56 78`, `0033612345678`, `+33 6 12 34 56 78`); `phone::normalize()` converts to E.164 server-side using the configured default country code, and `bookings.guest_phone` is E.164 from then on. This is not libphonenumber: it handles trunk and international prefixes and leaves real validity to the gateway. Numbers are shown to the host on the bookings dashboard and never to other guests.
+
+**Phone modes** (`event_types.sms_phone_mode`, three states rather than a boolean, same shape Cal.com converged on): `off` shows no field; `optional` shows one and says plainly that an empty answer means no SMS, so the guest is never silently dropped from a channel they expected; `required` enforces it, for event types where the message is the point. `book.html` mirrors `phone::normalize` in JS via `setCustomValidity`, so a bad number is an inline field error rather than a full-page one; `resolve_guest_phone()` is the server-side backstop and returns the localised (title, message) pair to render.
+
+**Spend controls.** SMS is the one feature where a public, unauthenticated form spends real money on a recipient the guest chooses, which is the SMS pumping (AIT) attack. Three layers:
+- **Who may enable it**: `auth_config.sms_allow_all_users`, off by default, so only admins can put an event type into an SMS mode (same reasoning as shared resources). `can_enable_sms()` and `resolve_phone_mode()` enforce it server-side; a user who may not change it has the stored value carried forward, so a member editing an admin's event type cannot turn SMS off either.
+- **How much**: `sms_config.daily_cap` (0 = unlimited) checked in `notify_guest()` against `sms_usage`, which records segments and cost per accepted message and deliberately stores no recipient number. Over the cap, calrs stops texting and email carries on: a booking must never fail because the SMS budget ran out. The admin panel shows today's count and cost.
+- **Outside calrs**: the admin card tells the operator to restrict destination countries at the gateway (Twilio calls this Geo Permissions), keep the account prepaid without auto-recharge, and leave the captcha on. The panel warns when SMS is configured and the captcha is not, since that combination is the actual open relay.
+
+**Guest ICS:** `GET /booking/ics/{cancel_token}` serves the booking as `text/calendar`, and `confirmed.html` links it as "Add to calendar". The confirmation email already attaches one, but the guest is looking at the page at the moment they want to add it, and an instance with no SMTP never sends that email at all.
 
 ---
 

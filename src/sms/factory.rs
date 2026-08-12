@@ -47,10 +47,10 @@ pub const PROVIDER_SPECS: &[ProviderSpec] = &[
         docs_url: "https://www.twilio.com/docs/sms/api",
         api_key_label: Some("Account SID"),
         api_secret_label: "Auth token",
-        sender_label: "From number",
-        sender_hint: "A Twilio number in E.164 format, e.g. +15551234567.",
+        sender_label: "Sender",
+        sender_hint: "A Twilio number in E.164 format (+15551234567), or an alphanumeric sender ID where the destination country allows one.",
         base_url_label: Some("API base URL"),
-        base_url_hint: "Optional. Defaults to https://api.twilio.com.",
+        base_url_hint: "Optional. Defaults to https://api.twilio.com. Use https, the credential travels on this connection.",
         base_url_required: false,
         sender_required: true,
         supports_check: true,
@@ -64,7 +64,7 @@ pub const PROVIDER_SPECS: &[ProviderSpec] = &[
         sender_label: "Sender",
         sender_hint: "Up to 11 alphanumeric characters, or 15 digits.",
         base_url_label: Some("Region base URL"),
-        base_url_hint: "Optional. Defaults to https://gatewayapi.com; use https://gatewayapi.eu for the EU region.",
+        base_url_hint: "Optional. Defaults to https://gatewayapi.com; use https://gatewayapi.eu to keep traffic in the EU.",
         base_url_required: false,
         sender_required: true,
         supports_check: false,
@@ -200,6 +200,7 @@ mod tests {
             sender: "calrs".to_string(),
             base_url: String::new(),
             default_country_code: "+33".to_string(),
+            daily_cap: 0,
         }
     }
 

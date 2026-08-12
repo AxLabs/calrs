@@ -11,8 +11,8 @@
 //! rest (`crate::crypto`) and a `CALRS_SMS_*` environment block that overrides
 //! the database wholesale.
 //!
-//! The whole feature is opt-in twice over: with no `sms_config` row *and* no
-//! event type setting `sms_notifications_enabled`, nothing here ever runs.
+//! The whole feature is opt-in twice over: with no `sms_config` row *and* every
+//! event type leaving `sms_phone_mode` at `off`, nothing here ever runs.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -29,6 +29,43 @@ pub mod twilio;
 pub mod webhook;
 
 pub use factory::{kinds, PROVIDER_SPECS};
+
+/// Per-event-type phone policy, stored in `event_types.sms_phone_mode`.
+///
+/// Three states rather than a boolean, because "the guest may leave it empty"
+/// and "the message is the whole point of this event type" are genuinely
+/// different products. Cal.com converged on the same shape: the phone field is
+/// optional in general and becomes required once a workflow texts the attendee.
+pub mod phone_mode {
+    /// No field, no SMS. The default.
+    pub const OFF: &str = "off";
+    /// Field shown; an empty answer simply means no SMS for that booking.
+    pub const OPTIONAL: &str = "optional";
+    /// Field shown and enforced.
+    pub const REQUIRED: &str = "required";
+
+    pub const ALL: &[&str] = &[OFF, OPTIONAL, REQUIRED];
+
+    /// Normalise anything stored or posted into a known mode, defaulting to
+    /// the safe one.
+    pub fn parse(value: &str) -> &'static str {
+        match value.trim() {
+            OPTIONAL => OPTIONAL,
+            REQUIRED => REQUIRED,
+            _ => OFF,
+        }
+    }
+}
+
+/// Whether an event type asks the guest for a phone number at all.
+pub fn collects_phone(mode: &str) -> bool {
+    phone_mode::parse(mode) != phone_mode::OFF
+}
+
+/// Whether the guest must supply one to book.
+pub fn requires_phone(mode: &str) -> bool {
+    phone_mode::parse(mode) == phone_mode::REQUIRED
+}
 
 /// Instance-wide SMS gateway configuration.
 ///
@@ -49,6 +86,8 @@ pub struct SmsConfig {
     pub sender: String,
     pub base_url: String,
     pub default_country_code: String,
+    /// Messages per day across the whole instance, 0 meaning no limit.
+    pub daily_cap: i64,
 }
 
 impl std::fmt::Debug for SmsConfig {
@@ -60,6 +99,7 @@ impl std::fmt::Debug for SmsConfig {
             .field("sender", &self.sender)
             .field("base_url", &self.base_url)
             .field("default_country_code", &self.default_country_code)
+            .field("daily_cap", &self.daily_cap)
             .finish()
     }
 }
@@ -72,6 +112,7 @@ pub struct SmsStatus {
     pub sender: String,
     pub base_url: String,
     pub default_country_code: String,
+    pub daily_cap: i64,
     pub enabled: bool,
     pub from_env: bool,
 }
@@ -193,6 +234,7 @@ const SMS_ENV_VARS: &[&str] = &[
     "CALRS_SMS_SENDER",
     "CALRS_SMS_BASE_URL",
     "CALRS_SMS_DEFAULT_COUNTRY_CODE",
+    "CALRS_SMS_DAILY_CAP",
 ];
 
 /// Read an env var, returning `Some` only when set and non-empty.
@@ -223,6 +265,9 @@ fn load_config_from_env() -> Option<SmsConfig> {
         base_url: optional_env("CALRS_SMS_BASE_URL").unwrap_or_default(),
         default_country_code: optional_env("CALRS_SMS_DEFAULT_COUNTRY_CODE")
             .unwrap_or_else(|| phone::DEFAULT_COUNTRY_CODE.to_string()),
+        daily_cap: optional_env("CALRS_SMS_DAILY_CAP")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
     };
 
     match factory::validate_config(&config) {
@@ -257,14 +302,23 @@ pub async fn load_config(pool: &SqlitePool, key: &[u8; 32]) -> Result<Option<Sms
         String,
         Option<String>,
         String,
+        i64,
     )> = sqlx::query_as(
-        "SELECT provider, api_key, api_secret_enc, sender, base_url, default_country_code \
+        "SELECT provider, api_key, api_secret_enc, sender, base_url, default_country_code, daily_cap \
          FROM sms_config WHERE enabled = 1 LIMIT 1",
     )
     .fetch_optional(pool)
     .await?;
 
-    let Some((provider, api_key, api_secret_enc, sender, base_url, default_country_code)) = row
+    let Some((
+        provider,
+        api_key,
+        api_secret_enc,
+        sender,
+        base_url,
+        default_country_code,
+        daily_cap,
+    )) = row
     else {
         return Ok(None);
     };
@@ -281,6 +335,7 @@ pub async fn load_config(pool: &SqlitePool, key: &[u8; 32]) -> Result<Option<Sms
         sender,
         base_url: base_url.unwrap_or_default(),
         default_country_code,
+        daily_cap,
     };
 
     // A row that no longer validates (e.g. saved before a provider gained a
@@ -305,29 +360,40 @@ pub async fn load_status(pool: &SqlitePool) -> Result<Option<SmsStatus>> {
             sender: config.sender,
             base_url: config.base_url,
             default_country_code: config.default_country_code,
+            daily_cap: config.daily_cap,
             enabled: true,
             from_env: true,
         }));
     }
 
-    let row: Option<(String, Option<String>, String, Option<String>, String, bool)> =
-        sqlx::query_as(
-            "SELECT provider, api_key, sender, base_url, default_country_code, enabled \
+    let row: Option<(
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+        String,
+        i64,
+        bool,
+    )> = sqlx::query_as(
+        "SELECT provider, api_key, sender, base_url, default_country_code, daily_cap, enabled \
          FROM sms_config ORDER BY enabled DESC LIMIT 1",
-        )
-        .fetch_optional(pool)
-        .await?;
+    )
+    .fetch_optional(pool)
+    .await?;
 
     Ok(row.map(
-        |(provider, api_key, sender, base_url, default_country_code, enabled)| SmsStatus {
-            provider_label: factory::label(&provider),
-            provider,
-            api_key: api_key.unwrap_or_default(),
-            sender,
-            base_url: base_url.unwrap_or_default(),
-            default_country_code,
-            enabled,
-            from_env: false,
+        |(provider, api_key, sender, base_url, default_country_code, daily_cap, enabled)| {
+            SmsStatus {
+                provider_label: factory::label(&provider),
+                provider,
+                api_key: api_key.unwrap_or_default(),
+                sender,
+                base_url: base_url.unwrap_or_default(),
+                default_country_code,
+                daily_cap,
+                enabled,
+                from_env: false,
+            }
         },
     ))
 }
@@ -448,15 +514,31 @@ pub async fn notify_guest(pool: &SqlitePool, key: &[u8; 32], event: SmsEvent, ct
         return;
     }
 
+    // The booking form is public and the recipient is guest-controlled, so a
+    // runaway event type or an SMS pumping attempt would otherwise bill the
+    // operator without bound. Over the cap, email carries on alone: a booking
+    // must never fail because the SMS budget ran out.
+    if over_daily_cap(pool, &config).await {
+        tracing::warn!(
+            event = event.as_str(),
+            cap = config.daily_cap,
+            "daily SMS cap reached; skipping SMS (email is unaffected)"
+        );
+        return;
+    }
+
     let body = message::compose(event, &ctx);
     match send(&config, ctx.phone, &body).await {
-        Ok(receipt) => tracing::info!(
-            event = event.as_str(),
-            provider = %config.provider,
-            message_id = receipt.message_id.as_deref().unwrap_or(""),
-            segments = receipt.segments.unwrap_or(0),
-            "SMS sent"
-        ),
+        Ok(receipt) => {
+            tracing::info!(
+                event = event.as_str(),
+                provider = %config.provider,
+                message_id = receipt.message_id.as_deref().unwrap_or(""),
+                segments = receipt.segments.unwrap_or(0),
+                "SMS sent"
+            );
+            record_usage(pool, &config.provider, event.as_str(), &receipt).await;
+        }
         Err(e) => tracing::warn!(
             event = event.as_str(),
             provider = %config.provider,
@@ -464,6 +546,61 @@ pub async fn notify_guest(pool: &SqlitePool, key: &[u8; 32], event: SmsEvent, ct
             error = %e,
             "SMS send failed"
         ),
+    }
+}
+
+/// Messages accepted by the gateway since midnight (UTC, matching how the
+/// rest of the schema stores timestamps).
+pub async fn sent_today(pool: &SqlitePool) -> i64 {
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sms_usage WHERE sent_at >= date('now')")
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0)
+}
+
+/// Total cost reported by the gateway since midnight, and its currency.
+/// Gateways that do not price a message leave it out of the sum.
+pub async fn cost_today(pool: &SqlitePool) -> (f64, String) {
+    let row: Option<(Option<f64>, Option<String>)> = sqlx::query_as(
+        "SELECT SUM(cost), MAX(currency) FROM sms_usage WHERE sent_at >= date('now')",
+    )
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None);
+
+    match row {
+        Some((cost, currency)) => (cost.unwrap_or(0.0), currency.unwrap_or_default()),
+        None => (0.0, String::new()),
+    }
+}
+
+/// Whether the instance has already sent its allowance for today. A cap of 0
+/// means no limit, which is the default.
+async fn over_daily_cap(pool: &SqlitePool, config: &SmsConfig) -> bool {
+    if config.daily_cap <= 0 {
+        return false;
+    }
+    sent_today(pool).await >= config.daily_cap
+}
+
+/// Append to the usage ledger the cap counts and the admin panel reports from.
+/// Deliberately records no recipient: this is metering, not a message log.
+async fn record_usage(pool: &SqlitePool, provider: &str, event: &str, receipt: &SendReceipt) {
+    let result = sqlx::query(
+        "INSERT INTO sms_usage (id, event, provider, segments, cost, currency) \
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(event)
+    .bind(provider)
+    .bind(receipt.segments.map(|s| s as i64))
+    .bind(receipt.cost)
+    .bind(receipt.currency.as_deref())
+    .execute(pool)
+    .await;
+
+    if let Err(e) = result {
+        tracing::warn!(error = %e, "could not record SMS usage");
     }
 }
 

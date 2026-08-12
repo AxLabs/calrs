@@ -751,6 +751,18 @@ document.querySelectorAll('input[type="color"]').forEach(function(picker) {
   <p style="color: var(--error-text); font-size: 0.875rem;">✗ {{ sms_test_detail or "The SMS gateway refused the request." }}</p>
   {% endif %}
 
+  {% if sms_configured and not captcha_configured %}
+  <p style="color: var(--error-text); font-size: 0.85rem; border: 1px solid var(--error-text); border-radius: 6px; padding: 0.625rem 0.875rem;">
+    The booking form is public and the recipient number comes from the guest, so SMS without a captcha is an open relay someone else can bill you for. Configure the captcha above, and restrict destination countries in your gateway's own settings.
+  </p>
+  {% endif %}
+
+  {% if sms_configured %}
+  <div style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 1rem;">
+    Sent today: <strong>{{ sms_sent_today }}</strong>{% if sms_daily_cap > 0 %} of {{ sms_daily_cap }}{% endif %}{% if sms_cost_currency %} &middot; {{ sms_cost_today }} {{ sms_cost_currency }}{% endif %}
+  </div>
+  {% endif %}
+
   {% if sms_error %}
   <p style="color: var(--error-text); font-size: 0.875rem;">SMS configuration error: {{ sms_error }}</p>
   <p style="color: var(--text-muted); font-size: 0.8rem; margin-top: 0.75rem;">Fix the <code>CALRS_SMS_*</code> environment variables, or unset them to manage SMS from the database here.</p>
@@ -832,6 +844,11 @@ document.querySelectorAll('input[type="color"]').forEach(function(picker) {
         {% endfor %}
       </select>
     </div>
+    <div class="form-group" style="margin-top: 1rem;">
+      <label>Daily limit <span class="hint">(messages per day for the whole instance, 0 for no limit)</span></label>
+      <input type="number" name="daily_cap" min="0" step="1" value="{{ sms_daily_cap }}">
+      <span class="hint" style="font-size: 0.8rem; color: var(--text-muted); display: block; margin-top: 0.25rem;">Past the limit calrs stops texting and keeps sending email, so bookings never fail because the SMS budget ran out.</span>
+    </div>
     <button type="submit" class="slot-btn" style="cursor: pointer; font-weight: 600; color: var(--accent); border-color: var(--accent);">Save SMS settings</button>
   </form>
 
@@ -848,8 +865,23 @@ document.querySelectorAll('input[type="color"]').forEach(function(picker) {
   </form>
   {% endif %}
 
-  <p style="color: var(--text-muted); font-size: 0.8rem; margin-top: 1rem;">Alternatively, configure via environment variables (which override this): <code>CALRS_SMS_PROVIDER</code>, <code>CALRS_SMS_API_KEY</code>, <code>CALRS_SMS_API_SECRET</code>, <code>CALRS_SMS_SENDER</code>, <code>CALRS_SMS_BASE_URL</code>, <code>CALRS_SMS_DEFAULT_COUNTRY_CODE</code>.</p>
+  <p style="color: var(--text-muted); font-size: 0.8rem; margin-top: 1rem;">Alternatively, configure via environment variables (which override this): <code>CALRS_SMS_PROVIDER</code>, <code>CALRS_SMS_API_KEY</code>, <code>CALRS_SMS_API_SECRET</code>, <code>CALRS_SMS_SENDER</code>, <code>CALRS_SMS_BASE_URL</code>, <code>CALRS_SMS_DAILY_CAP</code>, <code>CALRS_SMS_DEFAULT_COUNTRY_CODE</code>.</p>
   {% endif %}
+
+  {# Instance policy, not gateway config, so it stays editable even when the
+     environment block governs the gateway. #}
+  <form method="post" action="/dashboard/admin/sms/policy" style="margin-top: 1.25rem; padding-top: 1.25rem; border-top: 1px solid var(--border);">
+    <label style="display: flex; align-items: center; gap: 0.5rem; font-size: 0.925rem; cursor: pointer;">
+      <input type="checkbox" name="allow_all_users" value="on" {% if sms_allow_all_users %}checked{% endif %} style="width: 1rem; height: 1rem;">
+      Let any user enable SMS on their event types
+    </label>
+    <span class="hint" style="font-size: 0.8rem; color: var(--text-muted); display: block; margin: 0.375rem 0 0.75rem;">Off by default: SMS spends credit on the account configured here, so only admins may switch an event type into an SMS mode.</span>
+    <button type="submit" class="slot-btn" style="cursor: pointer; font-weight: 600;">Save policy</button>
+  </form>
+
+  <p style="color: var(--text-muted); font-size: 0.8rem; margin-top: 1.25rem;">
+    <strong>Before going live:</strong> restrict destination countries in your gateway (Twilio calls this Geo Permissions), keep the account prepaid without auto-recharge, and leave the captcha on. Those three between them bound what an SMS pumping attempt can cost you.
+  </p>
 </div>
 
 <script>

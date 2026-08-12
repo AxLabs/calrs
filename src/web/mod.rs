@@ -510,6 +510,12 @@ pub async fn run_reminder_loop(pool: SqlitePool, secret_key: [u8; 32]) {
                     .map(|base| format!("{}/booking/cancel/{}", base.trim_end_matches('/'), t))
             });
 
+            // Tracks whether any channel could actually carry this reminder.
+            // Stamping `reminder_sent_at` when neither could would silently
+            // swallow it, so an instance whose SMTP is missing keeps the
+            // booking pending until SMTP comes back, as it did before SMS.
+            let mut notified = false;
+
             if let Some(smtp_config) = &smtp_config {
                 let _ = crate::email::send_guest_reminder(
                     smtp_config,
@@ -518,6 +524,7 @@ pub async fn run_reminder_loop(pool: SqlitePool, secret_key: [u8; 32]) {
                 )
                 .await;
                 let _ = crate::email::send_host_reminder(smtp_config, &details).await;
+                notified = true;
             }
 
             // Reminder SMS to the guest. Queried per booking rather than
@@ -544,8 +551,17 @@ pub async fn run_reminder_loop(pool: SqlitePool, secret_key: [u8; 32]) {
                             ctx,
                         )
                         .await;
+                        notified = true;
                     }
                 }
+            }
+
+            if !notified {
+                tracing::debug!(
+                    booking_id = %bid,
+                    "reminder deferred: no channel can deliver it yet"
+                );
+                continue;
             }
 
             // Mark reminder as sent
@@ -17063,10 +17079,30 @@ async fn admin_update_sms(
             Err(e) => return internal_error_response("check existing sms config", &e),
         };
 
+    // Switching gateway must come with that gateway's own credential: keeping
+    // the stored one would silently save, say, a Twilio auth token as a
+    // GatewayAPI token and only fail at send time, inside a booking.
+    let previous_provider: Option<String> =
+        match sqlx::query_scalar("SELECT provider FROM sms_config LIMIT 1")
+            .fetch_optional(&state.pool)
+            .await
+        {
+            Ok(row) => row,
+            Err(e) => return internal_error_response("check existing sms provider", &e),
+        };
+    let switching_provider = previous_provider
+        .as_deref()
+        .is_some_and(|prev| prev != provider);
+    if switching_provider && !secret_provided && provider != crate::sms::kinds::WEBHOOK {
+        return redirect_err("Switching SMS gateway requires entering that gateway's credential.");
+    }
+
     // Validate the configuration as it will actually be stored, secret
     // included, so a keep-current save of an incomplete row still fails loudly.
     let effective_secret = if secret_provided {
         api_secret.trim().to_string()
+    } else if switching_provider {
+        String::new()
     } else {
         match existing.as_ref().and_then(|(_, enc)| enc.as_deref()) {
             Some(enc) if !enc.is_empty() => {
@@ -17097,12 +17133,19 @@ async fn admin_update_sms(
     }
 
     let result = match existing {
-        Some((id, _)) if secret_provided => {
-            let api_secret_enc =
+        // A gateway switch always rewrites the secret column, even when the
+        // field was left empty (only the credential-less webhook can get
+        // here): carrying the previous gateway's secret over would otherwise
+        // sign webhook calls with, say, a Twilio auth token.
+        Some((id, _)) if secret_provided || switching_provider => {
+            let api_secret_enc = if secret_provided {
                 match crate::crypto::encrypt_password(&state.secret_key, api_secret.trim()) {
-                    Ok(s) => s,
+                    Ok(s) => Some(s),
                     Err(e) => return internal_error_response("encrypt sms secret", &e),
-                };
+                }
+            } else {
+                None
+            };
             sqlx::query(
                 "UPDATE sms_config SET provider = ?, api_key = ?, api_secret_enc = ?, sender = ?, base_url = ?, default_country_code = ?, enabled = ? WHERE id = ?",
             )
@@ -17118,7 +17161,9 @@ async fn admin_update_sms(
             .await
         }
         Some((id, _)) => {
-            // Keep-current: do not touch api_secret_enc.
+            // Keep-current: do not touch api_secret_enc. Only reachable when
+            // the gateway is unchanged (or is the credential-less webhook),
+            // so the stored secret still belongs to this gateway.
             sqlx::query(
                 "UPDATE sms_config SET provider = ?, api_key = ?, sender = ?, base_url = ?, default_country_code = ?, enabled = ? WHERE id = ?",
             )
@@ -29900,6 +29945,74 @@ mod tests {
         );
         // The country code shown in the hint comes from the SMS config.
         assert!(body.contains(crate::sms::phone::DEFAULT_COUNTRY_CODE));
+    }
+
+    // --- Switching gateway must not reuse the previous gateway's credential ---
+
+    #[tokio::test]
+    async fn switching_sms_gateway_requires_a_fresh_credential() {
+        let (app, pool, session, _) = setup_test_app().await;
+        let csrf = "test-csrf-sms-switch";
+
+        // Configure Twilio.
+        let body = "_csrf=test-csrf-sms-switch&provider=twilio&api_key=AC123&api_secret=twilio-token&sender=%2B15551234567&base_url=&default_country_code=%2B33&enabled=on";
+        let response = app
+            .clone()
+            .oneshot(post_form("/dashboard/admin/sms", &session, csrf, body))
+            .await
+            .unwrap();
+        assert!(response.status().is_redirection());
+        let stored: (String, Option<String>) =
+            sqlx::query_as("SELECT provider, api_secret_enc FROM sms_config")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored.0, "twilio");
+        let twilio_secret = stored.1.clone().expect("secret stored");
+
+        // Switching to another gateway with the secret field left empty must
+        // be refused rather than silently reusing the Twilio auth token.
+        let body = "_csrf=test-csrf-sms-switch&provider=sevenio&api_key=&api_secret=&sender=calrs&base_url=&default_country_code=%2B33&enabled=on";
+        let response = app
+            .clone()
+            .oneshot(post_form("/dashboard/admin/sms", &session, csrf, body))
+            .await
+            .unwrap();
+        assert!(response.status().is_redirection());
+        let location = response
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            location.contains("error="),
+            "expected a rejection: {}",
+            location
+        );
+
+        let stored: (String, Option<String>) =
+            sqlx::query_as("SELECT provider, api_secret_enc FROM sms_config")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored.0, "twilio", "the stored gateway must be unchanged");
+        assert_eq!(stored.1.as_deref(), Some(twilio_secret.as_str()));
+
+        // With a credential, the switch goes through and replaces the secret.
+        let body = "_csrf=test-csrf-sms-switch&provider=sevenio&api_key=&api_secret=seven-key&sender=calrs&base_url=&default_country_code=%2B33&enabled=on";
+        let response = app
+            .oneshot(post_form("/dashboard/admin/sms", &session, csrf, body))
+            .await
+            .unwrap();
+        assert!(response.status().is_redirection());
+
+        let config = crate::sms::load_config(&pool, &[0u8; 32])
+            .await
+            .unwrap()
+            .expect("configured");
+        assert_eq!(config.provider, "sevenio");
+        assert_eq!(config.api_secret, "seven-key");
     }
 
     // --- SMS gateway configuration round-trips through the database ---

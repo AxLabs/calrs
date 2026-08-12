@@ -169,11 +169,17 @@ pub trait SmsProvider: Send + Sync {
 /// Shared HTTP client. Built once so connections are pooled, and always with a
 /// timeout: these calls happen inline in the booking request path, where a
 /// hanging gateway would otherwise hang the guest's booking.
+///
+/// Redirects are not followed, matching the resource-feed client. `reqwest`
+/// strips `Authorization` on a cross-host redirect but leaves custom headers
+/// alone, so following one would hand seven.io's `X-Api-Key` to whatever host
+/// the redirect names.
 pub(crate) fn http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none())
             .user_agent("calrs-sms/1")
             .build()
             .unwrap_or_default()

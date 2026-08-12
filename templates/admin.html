@@ -801,21 +801,21 @@ document.querySelectorAll('input[type="color"]').forEach(function(picker) {
       {% if p.api_key_label %}
       <div class="form-group">
         <label>{{ p.api_key_label }}</label>
-        <input type="text" name="api_key" value="{{ sms_api_key }}" disabled>
+        <input type="text" name="api_key" value="{% if sms_provider == p.kind %}{{ sms_api_key }}{% endif %}"{% if sms_provider != p.kind %} disabled{% endif %}>
       </div>
       {% endif %}
       <div class="form-group">
         <label>{{ p.api_secret_label }} <span class="hint">(leave empty to keep current)</span></label>
-        <input type="password" name="api_secret" value="" placeholder="Leave empty to keep unchanged" disabled>
+        <input type="password" name="api_secret" value="" placeholder="{% if sms_provider == p.kind %}Leave empty to keep unchanged{% else %}Required when switching gateway{% endif %}"{% if sms_provider != p.kind %} disabled{% endif %}>
       </div>
       <div class="form-group">
         <label>{{ p.sender_label }} <span class="hint">{{ p.sender_hint }}</span></label>
-        <input type="text" name="sender" value="{{ sms_sender }}" disabled>
+        <input type="text" name="sender" value="{% if sms_provider == p.kind %}{{ sms_sender }}{% endif %}"{% if sms_provider != p.kind %} disabled{% endif %}>
       </div>
       {% if p.base_url_label %}
       <div class="form-group">
         <label>{{ p.base_url_label }} <span class="hint">{{ p.base_url_hint }}</span></label>
-        <input type="text" name="base_url" value="{{ sms_base_url }}" disabled>
+        <input type="text" name="base_url" value="{% if sms_provider == p.kind %}{{ sms_base_url }}{% endif %}"{% if sms_provider != p.kind %} disabled{% endif %}>
       </div>
       {% endif %}
       {% if p.docs_url %}
@@ -855,7 +855,9 @@ document.querySelectorAll('input[type="color"]').forEach(function(picker) {
 <script>
 (function() {
   // Show only the selected gateway's fields, and keep the hidden ones
-  // disabled so the browser never submits a second gateway's values.
+  // disabled so the browser never submits a second gateway's values. The
+  // server renders the selected gateway's inputs enabled already, so the
+  // form still works with JavaScript off.
   var select = document.getElementById('sms-provider');
   if (!select) return;
   var blocks = document.querySelectorAll('.sms-provider-fields');

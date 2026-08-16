@@ -9,6 +9,7 @@
 .action-menu-dropdown a:hover, .action-menu-dropdown button:hover { background: var(--surface-hover); }
 .action-menu-dropdown .danger { color: var(--error-text); }
 .et-meta { font-size: 0.8rem; color: var(--text-muted); margin-top: 0.15rem; }
+.copy-link-btn.copied { color: var(--success) !important; border-color: var(--success) !important; }
 </style>
 <div class="card">
   <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
@@ -37,6 +38,7 @@
         </div>
       </div>
       <div class="et-actions">
+        <button type="button" class="slot-btn copy-link-btn" style="font-size: 0.8rem; cursor: pointer;" title="Copy booking link" data-path="/{% if et.is_team %}team/{{ et.team_slug }}{% else %}u/{{ username }}{% endif %}/{{ et.slug }}">Copy</button>
         {% if et.can_manage %}
         <a href="{{ et.edit_url }}" class="slot-btn" style="text-decoration: none; font-size: 0.8rem;">Edit</a>
         <form method="post" action="{{ et.toggle_url }}" style="margin: 0;">
@@ -78,6 +80,16 @@
 
 <script>
 document.addEventListener('click', function(e) {
+  var copyBtn = e.target.closest('.copy-link-btn');
+  if (copyBtn) {
+    var url = window.location.origin + copyBtn.dataset.path;
+    navigator.clipboard.writeText(url).then(function() {
+      copyBtn.textContent = 'Copied!';
+      copyBtn.classList.add('copied');
+      setTimeout(function() { copyBtn.textContent = 'Copy'; copyBtn.classList.remove('copied'); }, 1500);
+    });
+    return;
+  }
   var btn = e.target.closest('.action-menu-toggle');
   if (btn) {
     e.stopPropagation();

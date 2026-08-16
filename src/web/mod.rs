@@ -345,8 +345,8 @@ async fn meeting_provider_labels(state: &AppState) -> (String, String) {
 
 /// Pick the location URL to expose on a freshly-created booking.
 ///
-/// When the event type uses an auto provider (`jitsi_auto`, `webhook_auto`)
-/// **and** the booking is going straight to confirmed, we generate a fresh
+/// When the event type uses an auto provider (`jitsi_auto`, `webhook_auto`,
+/// `google_meet`) **and** the booking is going straight to confirmed, we generate a fresh
 /// URL via `meeting::generate_and_persist` and store it on the booking row.
 /// Otherwise we fall back to the event type's static `location_value`. The
 /// returned value is what gets piped into the email + ICS + CalDAV write.
@@ -382,6 +382,22 @@ async fn resolve_booking_location(
     static_location_value
         .map(str::to_string)
         .filter(|s| !s.is_empty())
+}
+
+/// Reject `google_meet` unless every scheduling-relevant host has Google
+/// Calendar OAuth2 connected with a write-back calendar selected.
+async fn google_meet_location_error(
+    pool: &SqlitePool,
+    location_type: &str,
+    personal_user_id: Option<&str>,
+    team_id: Option<&str>,
+    event_type_id: Option<&str>,
+) -> Option<String> {
+    if location_type != meeting::LOCATION_TYPE_GOOGLE_MEET {
+        return None;
+    }
+    crate::google_meet::google_meet_prereq_error(pool, personal_user_id, team_id, event_type_id)
+        .await
 }
 
 /// Background task that sends booking reminders on a 60-second tick. Also
@@ -4285,8 +4301,9 @@ async fn confirm_booking(
         String,
         Option<String>,
         String,
+        Option<String>,
     )> = sqlx::query_as(
-        "SELECT b.id, b.uid, b.guest_name, b.guest_email, b.start_at, b.end_at, et.title, COALESCE(NULLIF(b.meeting_url, ''), et.location_value), b.cancel_token, COALESCE(b.guest_timezone, 'UTC'), b.reschedule_token, et.id
+        "SELECT b.id, b.uid, b.guest_name, b.guest_email, b.start_at, b.end_at, et.title, COALESCE(NULLIF(b.meeting_url, ''), et.location_value), b.cancel_token, COALESCE(b.guest_timezone, 'UTC'), b.reschedule_token, et.id, b.assigned_user_id
              FROM bookings b
              JOIN event_types et ON et.id = b.event_type_id
              JOIN accounts a ON a.id = et.account_id
@@ -4311,6 +4328,7 @@ async fn confirm_booking(
         guest_timezone,
         reschedule_token,
         et_id,
+        assigned_user_id,
     ) = match booking {
         Some(b) => b,
         None => return Redirect::to("/dashboard/bookings").into_response(),
@@ -4373,7 +4391,10 @@ async fn confirm_booking(
         &state,
         &bid,
         &et_id,
-        Some(&user.id),
+        Some(meeting::confirm_host_user_id(
+            assigned_user_id.as_deref(),
+            user.id.as_str(),
+        )),
         location_value.as_deref(),
         &guest_name,
         &guest_email,
@@ -4485,7 +4506,7 @@ struct EventTypeForm {
     min_notice_min: String,
     requires_confirmation: Option<String>, // checkbox: "on" or absent
     visibility: Option<String>,            // "public", "internal", or "private"
-    location_type: Option<String>, // "link", "phone", "in_person", "custom", "jitsi_auto", "webhook_auto"
+    location_type: Option<String>, // "link", "phone", "in_person", "custom", "jitsi_auto", "webhook_auto", "google_meet"
     location_value: Option<String>,
     // Optional per-event-type pattern override for the jitsi_auto provider.
     // NULL/empty falls back to the org-wide default pattern from auth_config.
@@ -4954,10 +4975,7 @@ async fn create_event_type(
         .as_deref()
         .filter(|s| !s.trim().is_empty());
 
-    let location_required = !matches!(
-        location_type,
-        meeting::LOCATION_TYPE_JITSI | meeting::LOCATION_TYPE_WEBHOOK
-    );
+    let location_required = !meeting::is_auto_location(location_type);
     if location_required && location_value.is_none() {
         return render_event_type_form_error(
             &state,
@@ -4968,6 +4986,14 @@ async fn create_event_type(
         )
         .await
         .into_response();
+    }
+
+    if let Some(err) =
+        google_meet_location_error(&state.pool, location_type, Some(&user.id), team_id, None).await
+    {
+        return render_event_type_form_error(&state, &auth_user, &err, &form, false)
+            .await
+            .into_response();
     }
 
     // Only team admins (or global admins) can create team event types.
@@ -5558,10 +5584,7 @@ async fn update_event_type(
         .as_deref()
         .filter(|s| !s.trim().is_empty());
 
-    let location_required = !matches!(
-        location_type,
-        meeting::LOCATION_TYPE_JITSI | meeting::LOCATION_TYPE_WEBHOOK
-    );
+    let location_required = !meeting::is_auto_location(location_type);
     if location_required && location_value.is_none() {
         return render_event_type_form_error(
             &state,
@@ -5572,6 +5595,20 @@ async fn update_event_type(
         )
         .await
         .into_response();
+    }
+
+    if let Some(err) = google_meet_location_error(
+        &state.pool,
+        location_type,
+        Some(&user.id),
+        None,
+        Some(&et_id),
+    )
+    .await
+    {
+        return render_event_type_form_error(&state, &auth_user, &err, &form, true)
+            .await
+            .into_response();
     }
 
     let reminder_minutes = {
@@ -8140,10 +8177,7 @@ async fn create_group_event_type(
 
     // Auto-meeting providers compute their own URL per booking; the static
     // location_value field is not used and may be empty.
-    let location_required = !matches!(
-        location_type,
-        meeting::LOCATION_TYPE_JITSI | meeting::LOCATION_TYPE_WEBHOOK
-    );
+    let location_required = !meeting::is_auto_location(location_type);
     if location_required && location_value.is_none() {
         return render_event_type_form_error(
             &state,
@@ -8154,6 +8188,14 @@ async fn create_group_event_type(
         )
         .await
         .into_response();
+    }
+
+    if let Some(err) =
+        google_meet_location_error(&state.pool, location_type, None, Some(&team_id), None).await
+    {
+        return render_event_type_form_error(&state, &auth_user, &err, &form, false)
+            .await
+            .into_response();
     }
 
     let default_calendar_view = match form.default_calendar_view.as_deref().unwrap_or("month") {
@@ -8690,10 +8732,7 @@ async fn update_group_event_type(
         .as_deref()
         .filter(|s| !s.trim().is_empty());
 
-    let location_required = !matches!(
-        location_type,
-        meeting::LOCATION_TYPE_JITSI | meeting::LOCATION_TYPE_WEBHOOK
-    );
+    let location_required = !meeting::is_auto_location(location_type);
     if location_required && location_value.is_none() {
         return render_event_type_form_error(
             &state,
@@ -8704,6 +8743,20 @@ async fn update_group_event_type(
         )
         .await
         .into_response();
+    }
+
+    if let Some(err) = google_meet_location_error(
+        &state.pool,
+        location_type,
+        None,
+        Some(&team_id),
+        Some(&et_id),
+    )
+    .await
+    {
+        return render_event_type_form_error(&state, &auth_user, &err, &form, true)
+            .await
+            .into_response();
     }
 
     let reminder_minutes = {
@@ -10694,6 +10747,22 @@ async fn handle_dynamic_group_booking(
     if visibility != "public" {
         return Html("Dynamic group links are only available for public event types.".to_string())
             .into_response();
+    }
+
+    if loc_type == meeting::LOCATION_TYPE_GOOGLE_MEET {
+        let ids: Vec<String> = dg_users.iter().map(|u| u.0.clone()).collect();
+        let missing = crate::google_meet::users_missing_google_writeback(&state.pool, &ids).await;
+        if !missing.is_empty() {
+            return render_booking_action_error(
+                state,
+                headers,
+                "Google Meet is not available",
+                &format!(
+                    "Every participant must have Google Calendar connected with a write-back calendar selected. Still missing: {}.",
+                    missing.join(", ")
+                ),
+            );
+        }
     }
 
     let needs_approval = requires_confirmation != 0;
@@ -17031,9 +17100,9 @@ async fn approve_booking_by_token(
 ) -> impl IntoResponse {
     let lang = crate::i18n::detect_from_headers(&headers);
     // Look up booking by confirm_token
-    let booking: Option<(String, String, String, String, String, String, String, String, String, Option<String>, Option<String>, String, Option<String>, String)> =
+    let booking: Option<(String, String, String, String, String, String, String, String, String, Option<String>, Option<String>, String, Option<String>, String, Option<String>)> =
         sqlx::query_as(
-            "SELECT b.id, b.uid, b.guest_name, b.guest_email, b.start_at, b.end_at, et.title, a.user_id, u.name, et.location_value, b.cancel_token, COALESCE(b.guest_timezone, 'UTC'), b.reschedule_token, b.event_type_id
+            "SELECT b.id, b.uid, b.guest_name, b.guest_email, b.start_at, b.end_at, et.title, a.user_id, u.name, et.location_value, b.cancel_token, COALESCE(b.guest_timezone, 'UTC'), b.reschedule_token, b.event_type_id, b.assigned_user_id
              FROM bookings b
              JOIN event_types et ON et.id = b.event_type_id
              JOIN accounts a ON a.id = et.account_id
@@ -17060,6 +17129,7 @@ async fn approve_booking_by_token(
         guest_timezone,
         reschedule_token,
         event_type_id,
+        assigned_user_id,
     ) = match booking {
         Some(b) => b,
         None => {
@@ -17174,7 +17244,10 @@ async fn approve_booking_by_token(
         &state,
         &bid,
         &event_type_id,
-        Some(&user_id),
+        Some(meeting::confirm_host_user_id(
+            assigned_user_id.as_deref(),
+            user_id.as_str(),
+        )),
         location_value.as_deref(),
         &guest_name,
         &guest_email,
@@ -18956,8 +19029,9 @@ async fn caldav_push_booking_for_user(
         Option<String>,
         Option<String>,
         String,
+        Option<String>,
     )> = sqlx::query_as(
-        "SELECT cs.id, cs.url, cs.username, cs.password_enc, cs.write_calendar_href, cs.auth_type, cs.access_token_enc, cs.token_expires_at, cs.provider_type
+        "SELECT cs.id, cs.url, cs.username, cs.password_enc, cs.write_calendar_href, cs.auth_type, cs.access_token_enc, cs.token_expires_at, cs.provider_type, cs.oauth2_provider
          FROM caldav_sources cs
          JOIN accounts a ON a.id = cs.account_id
          WHERE a.user_id = ? AND cs.enabled = 1 AND cs.write_calendar_href IS NOT NULL",
@@ -19008,8 +19082,43 @@ async fn caldav_push_booking_for_user(
         access_token_enc,
         token_expires_at,
         provider_type,
+        oauth2_provider,
     ) in &sources
     {
+        if crate::google_meet::should_skip_caldav_put(
+            pool,
+            booking_uid,
+            user_id,
+            auth_type,
+            oauth2_provider.as_deref(),
+        )
+        .await
+        {
+            if let Err(e) = crate::google_meet::patch_owner_event_times(
+                pool,
+                key,
+                user_id,
+                booking_uid,
+                details,
+                &crate::google_meet::LiveGoogleMeetApi,
+            )
+            .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    uid = %booking_uid,
+                    "google meet: skipped CalDAV PUT but could not patch event times"
+                );
+            } else {
+                tracing::info!(
+                    uid = %booking_uid,
+                    calendar_href = %calendar_href,
+                    "google meet: patched event times, skipped CalDAV PUT to preserve conferenceData"
+                );
+            }
+            continue;
+        }
+
         tracing::debug!(uid = %booking_uid, calendar_href = %calendar_href, provider = %provider_type, "pushing booking to calendar");
 
         let put_result = if provider_type == crate::providers::factory::kinds::EWS {

@@ -1,6 +1,6 @@
 //! Auto-generated video meeting links (issue #45).
 //!
-//! Two providers ship today:
+//! Three providers ship today:
 //!
 //! * **Jitsi** — a fresh room is computed locally from a pattern of tokens
 //!   (`{username}`, `{event}`, `{date}`, `{random}`) and appended to a base
@@ -9,6 +9,10 @@
 //!   when the booking is confirmed and expects `{"url": "..."}` back. The
 //!   request is optionally signed with HMAC-SHA256 so the receiver can prove
 //!   the call came from calrs.
+//! * **Google Meet** — a conference is attached to the host's Google Calendar
+//!   event via Calendar API `conferenceData` (issue #45 phase 3). Requires the
+//!   host to have a Google OAuth2 source with write-back configured. See
+//!   [`crate::google_meet`].
 //!
 //! The generated URL is persisted to `bookings.meeting_url` and read back by
 //! every downstream consumer (host email, ICS attachment, CalDAV write-back,
@@ -38,6 +42,28 @@ pub const DEFAULT_JITSI_PATTERN: &str = "{event}-{random}";
 /// Location type stored in `event_types.location_type` for the auto providers.
 pub const LOCATION_TYPE_JITSI: &str = "jitsi_auto";
 pub const LOCATION_TYPE_WEBHOOK: &str = "webhook_auto";
+pub const LOCATION_TYPE_GOOGLE_MEET: &str = crate::google_meet::LOCATION_TYPE;
+
+/// True when the event type mints a per-booking URL instead of a static value.
+pub fn is_auto_location(location_type: &str) -> bool {
+    matches!(
+        location_type,
+        LOCATION_TYPE_JITSI | LOCATION_TYPE_WEBHOOK | LOCATION_TYPE_GOOGLE_MEET
+    )
+}
+
+/// Host whose identity feeds auto meeting URLs on confirm/approve.
+///
+/// Prefer the assigned member; otherwise the event-type owner. Never the
+/// clicking approver: a team admin may approve a booking they do not host,
+/// and using them would stamp the wrong `{username}` into a Jitsi room or
+/// mint Google Meet on the wrong calendar.
+pub fn confirm_host_user_id<'a>(
+    assigned_user_id: Option<&'a str>,
+    owner_user_id: &'a str,
+) -> &'a str {
+    assigned_user_id.unwrap_or(owner_user_id)
+}
 
 /// Webhook auth mode stored in `auth_config.meeting_webhook_auth_mode`.
 pub const WEBHOOK_AUTH_NONE: &str = "none";
@@ -192,6 +218,7 @@ pub fn provider_label(location_type: &str, cfg: &MeetingConfig) -> Option<String
     match location_type {
         LOCATION_TYPE_JITSI => cfg.jitsi.as_ref().and_then(|j| j.display_name.clone()),
         LOCATION_TYPE_WEBHOOK => cfg.webhook.as_ref().and_then(|w| w.display_name.clone()),
+        LOCATION_TYPE_GOOGLE_MEET => Some("Google Meet".to_string()),
         _ => None,
     }
 }
@@ -400,7 +427,10 @@ pub async fn generate_and_persist(
     .flatten();
     let (location_type, event_slug, pattern_override) = et?;
 
-    if location_type != LOCATION_TYPE_JITSI && location_type != LOCATION_TYPE_WEBHOOK {
+    if location_type != LOCATION_TYPE_JITSI
+        && location_type != LOCATION_TYPE_WEBHOOK
+        && location_type != LOCATION_TYPE_GOOGLE_MEET
+    {
         return None;
     }
 
@@ -452,6 +482,15 @@ pub async fn generate_and_persist(
                 end_at: &end_at,
             };
             call_webhook(webhook_cfg, &payload).await.ok()
+        }
+        LOCATION_TYPE_GOOGLE_MEET => {
+            crate::google_meet::create_meet_for_booking(
+                pool,
+                secret_key,
+                booking_id,
+                &crate::google_meet::LiveGoogleMeetApi,
+            )
+            .await
         }
         _ => None,
     }?;
@@ -679,6 +718,21 @@ mod tests {
         assert_eq!(WebhookAuthMode::from_str("none").as_str(), "none");
         assert_eq!(WebhookAuthMode::from_str("").as_str(), "none");
         assert_eq!(WebhookAuthMode::from_str("garbage").as_str(), "none");
+    }
+
+    #[test]
+    fn is_auto_location_covers_all_providers() {
+        assert!(is_auto_location(LOCATION_TYPE_JITSI));
+        assert!(is_auto_location(LOCATION_TYPE_WEBHOOK));
+        assert!(is_auto_location(LOCATION_TYPE_GOOGLE_MEET));
+        assert!(!is_auto_location("link"));
+        assert!(!is_auto_location("phone"));
+    }
+
+    #[test]
+    fn confirm_host_prefers_assigned_over_owner() {
+        assert_eq!(confirm_host_user_id(Some("bob"), "alice"), "bob");
+        assert_eq!(confirm_host_user_id(None, "alice"), "alice");
     }
 
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};

@@ -154,6 +154,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 | Runtime base URL + allowlist | 1.14.0 | Public base URL and private-host allowlist editable from the admin panel instead of env-only |
 | Shared bookable resources | 1.15.0 | Instance-level resources (demo lab, meeting rooms) backed by an ICS feed: busy resources block slots, reservations written back over CalDAV |
 | Per-resource team allowlists | 1.15.0 | Team admins attach allowlisted resources to their own team event types, enforced server-side |
+| Google Meet auto-links | Unreleased | Host-owned Google Meet conference per confirmed booking, using existing Google Calendar OAuth2 tokens (#45 phase 3) |
+
+## [Unreleased]
+
+### Added
+
+- **Google Meet auto-generated links** (issue #45 phase 3) - Event types can use location `google_meet`. On confirmation, calrs attaches a Meet conference to the host's Google Calendar event via Calendar API `conferenceData` (same OAuth tokens as Google CalDAV, no extra scope). The Meet URL flows through emails, ICS, and other calendar write-backs. Team event types require every eligible member to have Google Calendar connected with write-back before the location can be saved. Round-robin assigns Meet to `assigned_user_id`; collective uses the same host as ORGANIZER.
+
+### Fixed
+
+- **Approval-path meeting host** - Dashboard and email-token approval now pass `COALESCE(assigned_user_id, owner)` into meeting URL generation, so a team admin approving a round-robin booking no longer stamps their own username into a Jitsi room (or own the Google Meet) instead of the assigned member.
 
 ## [1.15.1] - 2026-08-02
 

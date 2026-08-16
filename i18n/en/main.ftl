@@ -27,6 +27,7 @@ confirmed-book-another = Book another time
 
 slots-location-video = Video call
 slots-location-phone = Phone call
+slots-location-google-meet = Google Meet
 
 slots-tz-label = Your timezone
 slots-time-format-label = Time format

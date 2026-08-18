@@ -15,10 +15,13 @@
 //! which is why write-back skips the owner's Google source once `meeting_url`
 //! is set.
 
+use std::sync::OnceLock;
+
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use chrono::{NaiveDateTime, TimeZone};
 use chrono_tz::Tz;
+use fluent_bundle::{FluentArgs, FluentValue};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
@@ -33,6 +36,8 @@ pub const LOCATION_TYPE: &str = "google_meet";
 /// Default attempts when Google reports `conferenceData.status = pending`.
 pub const DEFAULT_PENDING_ATTEMPTS: u32 = 5;
 const DEFAULT_PENDING_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+/// Cap list/patch/get retries so a slow Calendar API cannot stall confirm.
+const ATTACH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Query parameter that must be `1` or Google silently ignores conferenceData.
 pub const CONFERENCE_DATA_VERSION: &str = "1";
@@ -494,21 +499,30 @@ pub async fn google_meet_prereq_error(
     } else if let Some(uid) = personal_user_id {
         vec![uid.to_string()]
     } else {
-        return Some("Google Meet requires a host with Google Calendar connected.".to_string());
+        return Some(crate::i18n::translate(
+            "en",
+            "google-meet-prereq-no-host",
+            None,
+        ));
     };
     if ids.is_empty() {
-        return Some(
-            "Google Meet requires at least one eligible team member with Google Calendar connected."
-                .to_string(),
-        );
+        return Some(crate::i18n::translate(
+            "en",
+            "google-meet-prereq-no-eligible",
+            None,
+        ));
     }
     let missing = users_missing_google_writeback(pool, &ids).await;
     if missing.is_empty() {
         return None;
     }
-    Some(format!(
-        "Google Meet requires every host to have Google Calendar connected with a write-back calendar selected. Still missing: {}. Connect them at Dashboard → Calendar sources.",
-        missing.join(", ")
+    let names = missing.join(", ");
+    let mut args = FluentArgs::new();
+    args.set("names", FluentValue::from(names.as_str()));
+    Some(crate::i18n::translate(
+        "en",
+        "google-meet-prereq-missing",
+        Some(&args),
     ))
 }
 
@@ -618,15 +632,28 @@ pub async fn create_meet_for_booking_with_config(
         return None;
     }
 
-    attach_meet(
-        api,
-        &access_token,
-        &calendar_id,
-        &details.uid,
-        booking_id,
-        config,
+    match tokio::time::timeout(
+        ATTACH_DEADLINE,
+        attach_meet(
+            api,
+            &access_token,
+            &calendar_id,
+            &details.uid,
+            booking_id,
+            config,
+        ),
     )
     .await
+    {
+        Ok(url) => url,
+        Err(_) => {
+            tracing::warn!(
+                booking_id = %booking_id,
+                "google meet: attach_meet timed out"
+            );
+            None
+        }
+    }
 }
 
 /// Look up the CalDAV-created event by iCalUID, PATCH conferenceData, retry
@@ -740,15 +767,57 @@ pub async fn patch_owner_event_times(
         .find_event_id(&access_token, &calendar_id, booking_uid)
         .await?
         .ok_or_else(|| anyhow!("Google event not found for iCalUID {}", booking_uid))?;
-    let (start, end) = rfc3339_range(
-        &details.date,
-        &details.start_time,
-        &details.end_time,
-        &details.guest_timezone,
+
+    // bookings.start_at / end_at are naive host-zone datetimes and each has
+    // its own date, so they survive midnight wrap and mixed guest/host tz in
+    // BookingDetails (claim_booking builds details in guest-local wall clock).
+    let stored: Option<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT b.start_at, b.end_at, et.timezone
+         FROM bookings b
+         JOIN event_types et ON et.id = b.event_type_id
+         WHERE b.uid = ?",
     )
+    .bind(booking_uid)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+
+    let (start, end) = if let Some((start_at, end_at, et_tz)) = stored {
+        let tz = et_tz
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("UTC");
+        rfc3339_from_stored(&start_at, &end_at, tz)
+    } else {
+        let tz = if !details.host_timezone.trim().is_empty() {
+            details.host_timezone.as_str()
+        } else {
+            details.guest_timezone.as_str()
+        };
+        rfc3339_range(&details.date, &details.start_time, &details.end_time, tz)
+    }
     .ok_or_else(|| anyhow!("could not convert booking times to RFC3339"))?;
     api.patch_times(&access_token, &calendar_id, &event_id, &start, &end)
         .await
+}
+
+fn naive_range_to_rfc3339(
+    start_naive: NaiveDateTime,
+    mut end_naive: NaiveDateTime,
+    timezone: &str,
+) -> Option<(String, String)> {
+    let tz: Tz = timezone.parse().ok()?;
+    if end_naive <= start_naive {
+        end_naive += chrono::Duration::days(1);
+    }
+    let start_utc = tz.from_local_datetime(&start_naive).earliest()?.to_utc();
+    let end_utc = tz.from_local_datetime(&end_naive).earliest()?.to_utc();
+    Some((
+        start_utc.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        end_utc.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    ))
 }
 
 pub fn rfc3339_range(
@@ -757,19 +826,30 @@ pub fn rfc3339_range(
     end_time: &str,
     timezone: &str,
 ) -> Option<(String, String)> {
-    let tz: Tz = timezone.parse().ok()?;
     let start_naive =
         NaiveDateTime::parse_from_str(&format!("{} {}:00", date, start_time), "%Y-%m-%d %H:%M:%S")
             .ok()?;
     let end_naive =
         NaiveDateTime::parse_from_str(&format!("{} {}:00", date, end_time), "%Y-%m-%d %H:%M:%S")
             .ok()?;
-    let start_utc = tz.from_local_datetime(&start_naive).earliest()?.to_utc();
-    let end_utc = tz.from_local_datetime(&end_naive).earliest()?.to_utc();
-    Some((
-        start_utc.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        end_utc.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-    ))
+    naive_range_to_rfc3339(start_naive, end_naive, timezone)
+}
+
+fn parse_stored_naive(value: &str) -> Option<NaiveDateTime> {
+    NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S")
+        .ok()
+        .or_else(|| {
+            let (d, t) = split_stored_datetime(value)?;
+            NaiveDateTime::parse_from_str(&format!("{} {}:00", d, t), "%Y-%m-%d %H:%M:%S").ok()
+        })
+}
+
+fn rfc3339_from_stored(start_at: &str, end_at: &str, timezone: &str) -> Option<(String, String)> {
+    naive_range_to_rfc3339(
+        parse_stored_naive(start_at)?,
+        parse_stored_naive(end_at)?,
+        timezone,
+    )
 }
 
 async fn booking_details_for_meet(
@@ -858,11 +938,11 @@ async fn booking_details_for_meet(
 }
 
 fn split_stored_datetime(value: &str) -> Option<(String, String)> {
-    if value.len() < 16 {
+    if !value.is_ascii() {
         return None;
     }
-    let date = value[0..10].to_string();
-    let time = value[11..16].to_string();
+    let date = value.get(0..10)?.to_string();
+    let time = value.get(11..16)?.to_string();
     if date.as_bytes().get(4) != Some(&b'-') {
         return None;
     }
@@ -874,12 +954,23 @@ fn is_http_url(url: &str) -> bool {
     lc.starts_with("http://") || lc.starts_with("https://")
 }
 
+fn http_client() -> reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .user_agent("calrs-google-meet/1")
+                .build()
+                .expect("reqwest client")
+        })
+        .clone()
+}
+
 async fn calendar_api_get(access_token: &str, url: &str) -> Result<Value> {
-    let resp = reqwest::Client::new()
+    let resp = http_client()
         .get(url)
         .bearer_auth(access_token)
-        .header("user-agent", "calrs-google-meet/1")
-        .timeout(std::time::Duration::from_secs(10))
         .send()
         .await?;
     if !resp.status().is_success() {
@@ -891,13 +982,11 @@ async fn calendar_api_get(access_token: &str, url: &str) -> Result<Value> {
 }
 
 async fn calendar_api_patch(access_token: &str, url: &str, body: &Value) -> Result<Value> {
-    let resp = reqwest::Client::new()
+    let resp = http_client()
         .patch(url)
         .bearer_auth(access_token)
         .header("content-type", "application/json")
-        .header("user-agent", "calrs-google-meet/1")
         .json(body)
-        .timeout(std::time::Duration::from_secs(10))
         .send()
         .await?;
     if !resp.status().is_success() {
@@ -1053,6 +1142,37 @@ mod tests {
         let (start, end) = rfc3339_range("2026-06-05", "10:00", "10:30", "UTC").unwrap();
         assert_eq!(start, "2026-06-05T10:00:00Z");
         assert_eq!(end, "2026-06-05T10:30:00Z");
+    }
+
+    #[test]
+    fn rfc3339_range_crosses_midnight() {
+        let (start, end) = rfc3339_range("2026-06-05", "23:30", "00:15", "UTC").unwrap();
+        assert_eq!(start, "2026-06-05T23:30:00Z");
+        assert_eq!(end, "2026-06-06T00:15:00Z");
+    }
+
+    #[test]
+    fn rfc3339_range_non_utc() {
+        let (start, end) = rfc3339_range("2026-06-05", "10:00", "10:30", "Europe/Paris").unwrap();
+        assert_eq!(start, "2026-06-05T08:00:00Z");
+        assert_eq!(end, "2026-06-05T08:30:00Z");
+    }
+
+    #[test]
+    fn rfc3339_from_stored_uses_each_datetime() {
+        let (start, end) =
+            rfc3339_from_stored("2026-06-05T23:30:00", "2026-06-06T00:15:00", "UTC").unwrap();
+        assert_eq!(start, "2026-06-05T23:30:00Z");
+        assert_eq!(end, "2026-06-06T00:15:00Z");
+    }
+
+    #[test]
+    fn split_stored_datetime_rejects_non_ascii() {
+        assert!(split_stored_datetime("2026-06-05T1é:00:00").is_none());
+        assert_eq!(
+            split_stored_datetime("2026-06-05T10:00:00"),
+            Some(("2026-06-05".to_string(), "10:00".to_string()))
+        );
     }
 
     struct FakeApi {
@@ -1267,7 +1387,7 @@ mod tests {
         id
     }
 
-    async fn insert_google_source(pool: &SqlitePool, user_id: &str, with_write: bool) {
+    async fn insert_google_source(pool: &SqlitePool, user_id: &str, with_write: bool) -> String {
         let account_id: String =
             sqlx::query_scalar("SELECT id FROM accounts WHERE user_id = ? LIMIT 1")
                 .bind(user_id)
@@ -1279,16 +1399,18 @@ mod tests {
         } else {
             None
         };
+        let source_id = uuid::Uuid::new_v4().to_string();
         sqlx::query(
             "INSERT INTO caldav_sources (id, account_id, name, url, username, auth_type, oauth2_provider, access_token_enc, write_calendar_href, enabled)
              VALUES (?, ?, 'Google', 'https://apidata.googleusercontent.com/caldav/v2/alice%40gmail.com/user', 'alice@gmail.com', 'oauth2', 'google', 'tok', ?, 1)",
         )
-        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(&source_id)
         .bind(&account_id)
         .bind(href)
         .execute(pool)
         .await
         .unwrap();
+        source_id
     }
 
     async fn insert_event_type(
@@ -1514,7 +1636,7 @@ mod tests {
     async fn create_meet_for_booking_puts_then_patches() {
         let pool = memory_pool().await;
         let alice = insert_user(&pool, "alice@create.example.com", "Alice").await;
-        insert_google_source(&pool, &alice, true).await;
+        let source_id = insert_google_source(&pool, &alice, true).await;
         let et = insert_event_type(&pool, &alice, None, "round_robin", "google_meet").await;
         let (bid, _) = insert_booking(&pool, &et, None, None).await;
         let api = FakeApi::new("https://meet.google.com/created-room");
@@ -1522,12 +1644,15 @@ mod tests {
         // access_token_enc is plaintext "tok"; get_valid_access_token will try
         // decrypt and fail, then we cannot proceed. Seed an encrypted token.
         let enc = crate::crypto::encrypt_password(&key, "access-token").unwrap();
-        sqlx::query("UPDATE caldav_sources SET access_token_enc = ?, token_expires_at = ?")
-            .bind(&enc)
-            .bind((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339())
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE caldav_sources SET access_token_enc = ?, token_expires_at = ? WHERE id = ?",
+        )
+        .bind(&enc)
+        .bind((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339())
+        .bind(&source_id)
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let url = create_meet_for_booking_with_config(
             &pool,

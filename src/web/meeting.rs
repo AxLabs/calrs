@@ -379,9 +379,10 @@ pub async fn call_webhook(cfg: &WebhookConfig, payload: &WebhookPayload<'_>) -> 
 }
 
 /// Generate a meeting URL for a freshly-confirmed booking and persist it to
-/// `bookings.meeting_url`. Returns `Some(url)` when an auto provider produced
-/// a URL, `None` otherwise (event type uses a static location, the provider
-/// is not configured, or a webhook call failed).
+/// `bookings.meeting_url`. Returns `Some(url)` only when an auto provider
+/// produced a URL **and** the booking row was updated. Returns `None` if the
+/// event type uses a static location, the provider is not configured, a
+/// webhook/Meet call failed, or the persist `UPDATE` did not affect one row.
 ///
 /// Looks up everything it needs from the DB so callers only have to hand over
 /// the booking id, event type id, and assigned host user id. The "assigned"
@@ -495,13 +496,29 @@ pub async fn generate_and_persist(
         _ => None,
     }?;
 
-    let _ = sqlx::query("UPDATE bookings SET meeting_url = ? WHERE id = ?")
+    match sqlx::query("UPDATE bookings SET meeting_url = ? WHERE id = ?")
         .bind(&url)
         .bind(booking_id)
         .execute(pool)
-        .await;
-
-    Some(url)
+        .await
+    {
+        Ok(result) if result.rows_affected() == 1 => Some(url),
+        Ok(_) => {
+            tracing::error!(
+                booking_id = %booking_id,
+                "meeting URL generated but booking row was not updated"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                booking_id = %booking_id,
+                "failed to persist meeting URL"
+            );
+            None
+        }
+    }
 }
 
 /// Hex-encoded HMAC-SHA256 of `body` keyed by `secret`.

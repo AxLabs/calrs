@@ -90,7 +90,7 @@ For a self-hosted instance used by you and a handful of people, the Testing mode
 
 ## Google Meet auto-links
 
-When an event type's location is **Google Meet (auto-generated link)**, each confirmed booking gets a unique Meet conference owned by the host:
+When an event type's location is **Google Meet (auto-generated link)**, confirmed bookings attempt to attach a unique Meet conference owned by the host, as long as that host still has Google Calendar connected with write-back:
 
 1. calrs writes the booking to the host's Google write-back calendar (same CalDAV PUT as any other booking).
 2. It then calls Google Calendar API `events.patch` with `conferenceData.createRequest` (`hangoutsMeet`) using the host's existing OAuth token.

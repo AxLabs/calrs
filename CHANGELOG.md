@@ -164,7 +164,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Fixed
 
-- **Approval-path meeting host** - Dashboard and email-token approval now pass `COALESCE(assigned_user_id, owner)` into meeting URL generation, so a team admin approving a round-robin booking no longer stamps their own username into a Jitsi room (or own the Google Meet) instead of the assigned member.
+- **Approval-path meeting host** - Dashboard and email-token approval now pass `COALESCE(assigned_user_id, owner)` into meeting URL generation, so a team admin approving a round-robin booking no longer stamps their own username into a Jitsi room (or owns the Google Meet) instead of the assigned member.
 
 ## [1.15.1] - 2026-08-02
 

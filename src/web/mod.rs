@@ -4988,15 +4988,9 @@ async fn create_event_type(
         .into_response();
     }
 
-    if let Some(err) =
-        google_meet_location_error(&state.pool, location_type, Some(&user.id), team_id, None).await
-    {
-        return render_event_type_form_error(&state, &auth_user, &err, &form, false)
-            .await
-            .into_response();
-    }
-
     // Only team admins (or global admins) can create team event types.
+    // Run this before the Google Meet prerequisite check so a non-admin
+    // cannot probe whether a team has Google write-back configured.
     if let Some(tid) = team_id {
         let is_global_admin = user.role == "admin";
         if !is_global_admin && !is_team_admin(&state.pool, &user.id, tid).await {
@@ -5010,6 +5004,14 @@ async fn create_event_type(
             .await
             .into_response();
         }
+    }
+
+    if let Some(err) =
+        google_meet_location_error(&state.pool, location_type, Some(&user.id), team_id, None).await
+    {
+        return render_event_type_form_error(&state, &auth_user, &err, &form, false)
+            .await
+            .into_response();
     }
 
     let visibility = match form.visibility.as_deref().unwrap_or("public") {

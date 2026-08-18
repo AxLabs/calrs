@@ -82,7 +82,7 @@
         <option value="link" {% if form_location_type == "link" %}selected{% endif %}>Video call (static URL)</option>
         <option value="jitsi_auto" {% if form_location_type == "jitsi_auto" %}selected{% endif %}>Jitsi (auto-generated room)</option>
         <option value="webhook_auto" {% if form_location_type == "webhook_auto" %}selected{% endif %}>Webhook (custom provider)</option>
-        <option value="google_meet" {% if form_location_type == "google_meet" %}selected{% endif %}>Google Meet (auto-generated link)</option>
+        <option value="google_meet" {% if form_location_type == "google_meet" %}selected{% endif %}>{{ t("event-type-form-location-google-meet") }}</option>
         <option value="phone" {% if form_location_type == "phone" %}selected{% endif %}>Phone</option>
         <option value="in_person" {% if form_location_type == "in_person" %}selected{% endif %}>In person</option>
         <option value="custom" {% if form_location_type == "custom" %}selected{% endif %}>Custom</option>
@@ -102,7 +102,7 @@
         Per-booking meeting URL is fetched from the webhook configured by an admin under Admin &rarr; Meeting webhook. No URL needed here.
       </span>
       <span id="meeting-google-hint" class="hint" style="font-size: 0.8rem; color: var(--text-muted); display: none; margin-top: 0.25rem;">
-        A unique Google Meet link is created on confirmation, owned by the assigned host. Every host (you, or every eligible team member) must have Google Calendar connected with a write-back calendar selected.
+        {{ t("event-type-form-location-google-meet-hint") }}
       </span>
     </div>
   </div>

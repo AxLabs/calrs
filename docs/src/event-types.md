@@ -70,6 +70,18 @@ Whether a busy resource blocks a slot depends on the resource scheduling mode: i
 
 The **Required resources** section of the event type form is visible to global admins, and to team admins on team event types when their team is allowlisted for a resource. See [Shared Resources](./resources.md) for the full behavior, including the "all" vs "round-robin" scheduling modes.
 
+## SMS notifications
+
+Each event type decides whether the booking form asks the guest for a phone number, and whether it insists:
+
+| Mode | Booking form | Effect |
+|---|---|---|
+| **Off** (default) | No phone field | No SMS, ever |
+| **Optional** | Field shown, may be left empty | Guests who leave a number are texted when the booking is confirmed, moved, cancelled, or about to start |
+| **Required** | Field shown and enforced | The booking cannot be submitted without a number |
+
+The setting only appears when an SMS gateway is configured for the instance and you are permitted to change it: by default that means global admins only. See [SMS Notifications](./sms.md).
+
 ## Availability schedule
 
 Each event type has its own availability rules. By default: Monday–Friday, 09:00–17:00.

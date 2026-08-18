@@ -18002,9 +18002,9 @@ async fn approve_booking_by_token(
     let lang = crate::i18n::detect_from_headers(&headers);
     // Look up booking by confirm_token
     #[allow(clippy::type_complexity)]
-    let booking: Option<(String, String, String, String, String, String, String, String, String, Option<String>, Option<String>, String, Option<String>, String, Option<String>, Option<String>, String)> =
+    let booking: Option<(String, String, String, String, String, String, String, String, String, Option<String>, Option<String>, String, Option<String>, String, Option<String>, String)> =
         sqlx::query_as(
-            "SELECT b.id, b.uid, b.guest_name, b.guest_email, b.start_at, b.end_at, et.title, a.user_id, u.name, et.location_value, b.cancel_token, COALESCE(b.guest_timezone, 'UTC'), b.reschedule_token, b.event_type_id, b.assigned_user_id, b.guest_phone, et.sms_phone_mode
+            "SELECT b.id, b.uid, b.guest_name, b.guest_email, b.start_at, b.end_at, et.title, a.user_id, u.name, et.location_value, b.cancel_token, COALESCE(b.guest_timezone, 'UTC'), b.reschedule_token, b.event_type_id, b.guest_phone, et.sms_phone_mode
              FROM bookings b
              JOIN event_types et ON et.id = b.event_type_id
              JOIN accounts a ON a.id = et.account_id
@@ -18031,7 +18031,6 @@ async fn approve_booking_by_token(
         guest_timezone,
         reschedule_token,
         event_type_id,
-        assigned_user_id,
         guest_phone,
         sms_phone_mode,
     ) = match booking {
@@ -18046,6 +18045,16 @@ async fn approve_booking_by_token(
             return render_token_error(&state, &headers, &token, already);
         }
     };
+
+    // Fetched separately: sqlx tuple FromRow only goes to 16 columns.
+    let assigned_user_id: Option<String> =
+        sqlx::query_scalar("SELECT assigned_user_id FROM bookings WHERE id = ?")
+            .bind(&bid)
+            .fetch_optional(&state.pool)
+            .await
+            .ok()
+            .flatten()
+            .flatten();
 
     // Pending bookings do not block shared resources, so re-verify them at
     // approval time under the process-wide resource lock; in round-robin

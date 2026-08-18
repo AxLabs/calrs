@@ -266,3 +266,10 @@ confirmed-reschedule-notice-info = Rescheduling requires at least { $minutes } m
 booking-blocked-title-cancel = This booking can no longer be cancelled online
 booking-blocked-title-reschedule = This booking can no longer be rescheduled online
 booking-blocked-body = The host requires at least { $minutes } minutes of notice. If you cannot attend, please email <a href="mailto:{ $host_email }">{ $host_email }</a> directly.
+
+# Dashboard event types listing (templates/dashboard_event_types.html)
+
+dashboard-event-types-copy = Copy
+dashboard-event-types-copied = Copied!
+dashboard-event-types-copy-title = Copy booking link
+dashboard-event-types-copy-failed = Copy failed

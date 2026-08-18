@@ -1750,8 +1750,10 @@ async fn dashboard(
 async fn dashboard_event_types(
     State(state): State<Arc<AppState>>,
     auth_user: crate::auth::AuthUser,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let user = &auth_user.user;
+    let lang = crate::i18n::resolve(user.language.as_deref(), &headers);
 
     let event_types: Vec<(String, String, String, i32, bool, i32, i64, String)> = sqlx::query_as(
         "SELECT et.id, et.slug, et.title, et.duration_min, et.enabled, et.requires_confirmation,
@@ -1916,6 +1918,7 @@ async fn dashboard_event_types(
             can_create_team_et => can_create_team_et,
             impersonating => impersonating,
             impersonating_name => impersonating_name,
+            lang => lang,
         })
         .unwrap_or_else(|e| internal_error_body("template render", &e)),
     )

@@ -83,17 +83,33 @@ document.addEventListener('click', function(e) {
   var copyBtn = e.target.closest('.copy-link-btn');
   if (copyBtn) {
     var url = window.location.origin + copyBtn.dataset.path;
+    copyBtn._copyGen = (copyBtn._copyGen || 0) + 1;
+    var gen = copyBtn._copyGen;
+    if (copyBtn._copyTimer) {
+      clearTimeout(copyBtn._copyTimer);
+      copyBtn._copyTimer = null;
+    }
+    function stillCurrent() { return copyBtn._copyGen === gen; }
+    function restoreLabel() {
+      if (!stillCurrent()) return;
+      copyBtn.textContent = copyBtn.dataset.copyLabel;
+      copyBtn.classList.remove('copied');
+      copyBtn._copyTimer = null;
+    }
     function flashCopied() {
+      if (!stillCurrent()) return;
       copyBtn.textContent = copyBtn.dataset.copiedLabel;
       copyBtn.classList.add('copied');
-      setTimeout(function() { copyBtn.textContent = copyBtn.dataset.copyLabel; copyBtn.classList.remove('copied'); }, 1500);
+      copyBtn._copyTimer = setTimeout(restoreLabel, 1500);
     }
     function flashFailed() {
+      if (!stillCurrent()) return;
       copyBtn.textContent = copyBtn.dataset.copyFailedLabel;
       copyBtn.classList.remove('copied');
-      setTimeout(function() { copyBtn.textContent = copyBtn.dataset.copyLabel; }, 1500);
+      copyBtn._copyTimer = setTimeout(restoreLabel, 1500);
     }
     function fallbackCopy() {
+      if (!stillCurrent()) return;
       var ta = document.createElement('textarea');
       ta.value = url;
       ta.setAttribute('readonly', '');

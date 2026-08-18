@@ -993,6 +993,27 @@ struct OidcCallbackQuery {
     state: String,
 }
 
+/// Whether an ID token's `azp` (authorized party) claim is acceptable.
+///
+/// Because [`oidc_callback`] accepts ID tokens carrying audiences beyond our
+/// own `client_id`, this is the check that stops a multi-audience token minted
+/// for a *different* client, which happens to also list ours, from logging that
+/// client's user in. OIDC Core section 3.1.3.7 step 5 mandates it and
+/// `openidconnect` 4 does not implement it: the crate has the code written out
+/// in `verification/mod.rs` but commented out, deferred pending a clear use
+/// case.
+///
+/// A token with no `azp` is accepted, since IdPs commonly omit it and the nonce
+/// binding plus the mandatory `client_id`-in-`aud` check still apply. An `azp`
+/// present with no configured `client_id` to compare against fails closed.
+fn azp_matches_client(azp: Option<&str>, client_id: Option<&str>) -> bool {
+    match (azp, client_id) {
+        (None, _) => true,
+        (Some(azp), Some(client_id)) => azp == client_id,
+        (Some(_), None) => false,
+    }
+}
+
 async fn oidc_callback(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
@@ -1055,11 +1076,45 @@ async fn oidc_callback(
         None => return Html("No ID token in response.".to_string()).into_response(),
     };
 
-    let verifier = client.id_token_verifier();
+    // Accept ID tokens whose `aud` carries audiences in addition to our
+    // client_id. Several IdPs (e.g. Zitadel, which always adds the project_id;
+    // some Keycloak/Azure AD setups) emit multi-audience tokens. This is
+    // spec-compliant: OIDC Core §3.1.3.7 allows extra audiences. The default
+    // `openidconnect` verifier rejects any audience besides the client_id,
+    // which breaks login against those providers ("Invalid audiences: <x> is
+    // not a trusted audience"). The verifier still independently requires our
+    // own client_id to be present in `aud`, so a token minted for a different
+    // client is still rejected.
+    let verifier = client
+        .id_token_verifier()
+        .set_other_audience_verifier_fn(|_aud| true);
     let claims = match id_token.claims(&verifier, &Nonce::new(stored_nonce)) {
         Ok(c) => c,
         Err(e) => return crate::web::oidc_error_response("oidc id_token verify", &e),
     };
+
+    // Since we now accept additional audiences, restore the `azp` defense that
+    // OIDC Core §3.1.3.7 (5) mandates and that this crate does NOT implement
+    // (its README lists "verification of the azp claim" as unsupported): if the
+    // token carries an `azp` (authorized party) claim, it MUST equal our
+    // client_id. This rejects a multi-audience token that was actually issued
+    // for a *different* client but happens to also list ours. When `azp` is
+    // absent we fall back on the already-verified nonce binding plus the
+    // mandatory client_id-in-aud check, so IdPs that omit `azp` still work.
+    let azp = claims.authorized_party().map(|azp| azp.to_string());
+    if !azp_matches_client(azp.as_deref(), auth_config.oidc_client_id.as_deref()) {
+        // Routed through oidc_error_response like every other verification
+        // failure in this handler: it logs at error level and answers 500 with
+        // a generic body, so the rejection is visible to the operator without
+        // telling the caller which check it tripped.
+        return crate::web::oidc_error_response(
+            "oidc id_token azp",
+            &format!(
+                "authorized party {:?} does not match the configured client_id {:?}",
+                azp, auth_config.oidc_client_id
+            ),
+        );
+    }
 
     let subject = claims.subject().to_string();
     let email = claims
@@ -1804,6 +1859,40 @@ mod tests {
         .await
         .unwrap();
         id
+    }
+
+    // --- azp verification (multi-audience ID tokens) ---
+
+    #[test]
+    fn azp_absent_is_accepted() {
+        // IdPs commonly omit azp; the nonce binding and the mandatory
+        // client_id-in-aud check still apply, so this must not break login.
+        assert!(azp_matches_client(None, Some("calrs")));
+        assert!(azp_matches_client(None, None));
+    }
+
+    #[test]
+    fn azp_matching_our_client_is_accepted() {
+        assert!(azp_matches_client(Some("calrs"), Some("calrs")));
+    }
+
+    #[test]
+    fn azp_for_another_client_is_rejected() {
+        // The case that matters: a multi-audience token minted for a different
+        // client that happens to list ours in aud.
+        assert!(!azp_matches_client(Some("other-app"), Some("calrs")));
+    }
+
+    #[test]
+    fn azp_without_a_configured_client_id_fails_closed() {
+        assert!(!azp_matches_client(Some("calrs"), None));
+    }
+
+    #[test]
+    fn azp_comparison_is_exact() {
+        assert!(!azp_matches_client(Some("calrs "), Some("calrs")));
+        assert!(!azp_matches_client(Some("CALRS"), Some("calrs")));
+        assert!(!azp_matches_client(Some("calrs-staging"), Some("calrs")));
     }
 
     // --- generate_username ---
